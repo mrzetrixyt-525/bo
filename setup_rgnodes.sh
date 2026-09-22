@@ -94,23 +94,111 @@ if ! command -v lxc >/dev/null 2>&1 || ! lxc info >/dev/null 2>&1; then
 fi
 
 if ! lxc info >/dev/null 2>&1; then
-  if command -v lxd >/dev/null 2>&1; then
-    lxd init --auto
-  else
+  if ! command -v lxd >/dev/null 2>&1; then
     fail 'LXD is installed but its lxc/lxd client is not usable.'
+  fi
+  # Nested VPS hosts frequently do not expose /dev/loop-control. In that case
+  # lxd init --auto may select a loop-backed pool and fail. Force a directory
+  # storage pool instead; it requires no loop device and is persistent.
+  if [[ ! -e /dev/loop-control ]]; then
+    log '/dev/loop-control is unavailable; initializing LXD with dir storage (no loop backing).'
+    cat >/tmp/rgnodes-lxd-preseed.yaml <<'YAML'
+config: {}
+networks:
+- config:
+    ipv4.address: auto
+    ipv4.nat: "true"
+    ipv6.address: none
+  description: "RGNODES LXD bridge"
+  name: lxdbr0
+  type: bridge
+storage_pools:
+- config: {}
+  description: "RGNODES non-loop storage"
+  driver: dir
+  name: default
+profiles:
+- config: {}
+  description: "RGNODES default profile"
+  devices:
+    eth0:
+      name: eth0
+      network: lxdbr0
+      type: nic
+    root:
+      path: /
+      pool: default
+      type: disk
+  name: default
+YAML
+    lxd init --preseed </tmp/rgnodes-lxd-preseed.yaml
+    rm -f /tmp/rgnodes-lxd-preseed.yaml
+  else
+    lxd init --auto
   fi
 fi
 
 if ! lxc storage show default >/dev/null 2>&1; then
-  log 'LXD default storage pool is missing; attempting automatic initialization...'
-  lxd init --auto || true
+  log 'LXD default storage pool is missing; attempting non-destructive initialization...'
+  if [[ ! -e /dev/loop-control ]]; then
+    cat >/tmp/rgnodes-lxd-preseed.yaml <<'YAML'
+config: {}
+networks:
+- config:
+    ipv4.address: auto
+    ipv4.nat: "true"
+    ipv6.address: none
+  description: "RGNODES LXD bridge"
+  name: lxdbr0
+  type: bridge
+storage_pools:
+- config: {}
+  description: "RGNODES non-loop storage"
+  driver: dir
+  name: default
+profiles:
+- config: {}
+  description: "RGNODES default profile"
+  devices:
+    eth0:
+      name: eth0
+      network: lxdbr0
+      type: nic
+    root:
+      path: /
+      pool: default
+      type: disk
+  name: default
+YAML
+    lxd init --preseed </tmp/rgnodes-lxd-preseed.yaml || true
+    rm -f /tmp/rgnodes-lxd-preseed.yaml
+  else
+    lxd init --auto || true
+  fi
 fi
 lxc storage show default >/dev/null 2>&1 || warn 'LXD storage pool "default" was not detected. Set DEFAULT_STORAGE_POOL in .env to your real pool.'
+
+# Repair the common LXD baseline only when the objects are absent; never overwrite an existing network/profile.
+if ! lxc network show lxdbr0 >/dev/null 2>&1; then
+  log 'lxdbr0 is missing; creating a NAT bridge for the default profile.'
+  lxc network create lxdbr0 ipv4.address=auto ipv4.nat=true ipv6.address=none >/dev/null 2>&1 || true
+fi
+if ! lxc profile show default >/dev/null 2>&1; then
+  log 'LXD default profile is missing; creating a minimal default profile.'
+  lxc profile create default >/dev/null 2>&1 || true
+  lxc profile device add default root disk path=/ pool=default >/dev/null 2>&1 || true
+  lxc profile device add default eth0 nic name=eth0 network=lxdbr0 >/dev/null 2>&1 || true
+else
+  lxc profile device add default eth0 nic name=eth0 network=lxdbr0 >/dev/null 2>&1 || true
+fi
 
 log 'Installing PM2...'
 npm install -g pm2
 PM2_RUNTIME="$(command -v pm2-runtime || true)"
 [[ -n "$PM2_RUNTIME" ]] || fail 'pm2-runtime was not found after installation.'
+
+# Remove only the previous RGNODES PM2 app, never unrelated PM2 applications.
+pm2 delete RGNODES-VPS-BOT >/dev/null 2>&1 || true
 
 log 'Creating PM2 ecosystem configuration...'
 APP_DIR_JS=$(printf '%s' "$APP_DIR" | sed "s/[\\&']/\\\\\\&/g")
