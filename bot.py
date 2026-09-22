@@ -19,6 +19,7 @@ import secrets
 import base64
 import socket
 import re
+import sys
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -33,7 +34,7 @@ YOUR_SERVER_IP = os.getenv('YOUR_SERVER_IP', '127.0.0.1')
 MAIN_ADMIN_ID = int(os.getenv('MAIN_ADMIN_ID', '1493564911039811725'))
 VPS_USER_ROLE_ID = int(os.getenv('VPS_USER_ROLE_ID', '1503617617066197033'))
 DEFAULT_STORAGE_POOL = os.getenv('DEFAULT_STORAGE_POOL', 'default')
-HOST_MOTD = os.getenv('HOST_MOTD', 'bash <(curl -s https://raw.githubusercontent.com/mrzetrixyt-525/vm-/main/MOTD-Installer)')
+HOST_MOTD = ''  # MOTD managed separately; bot never executes remote MOTD scripts.
 BOT_VERSION = os.getenv('BOT_VERSION', '8.89 Stable PRO')
 BOT_DEVELOPER = os.getenv('BOT_DEVELOPER', 'MrZetrix')
 BOT_THUMBNAIL_URL = os.getenv('BOT_THUMBNAIL_URL', 'https://cdn.discordapp.com/icons/1503614184477167616/f1534b0b4cb22ff19872549b8a52d59f.webp?size=2048')
@@ -55,30 +56,8 @@ DEFAULT_VPS_EXPIRATION_DAYS = int(os.getenv('DEFAULT_VPS_EXPIRATION_DAYS', '60')
 EXPIRATION_WARNING_DAYS = int(os.getenv('EXPIRATION_WARNING_DAYS', '2'))
 
 # SSH Configuration
-SSH_FIX_SCRIPT = """#!/bin/bash
-cat > /etc/ssh/sshd_config << 'SSHEOF'
-Port 22
-AddressFamily any
-PasswordAuthentication yes
-PubkeyAuthentication yes
-PermitRootLogin yes
-PermitEmptyPasswords no
-ChallengeResponseAuthentication no
-UsePAM yes
-MaxAuthTries 6
-MaxSessions 10
-SyslogFacility AUTH
-LogLevel INFO
-X11Forwarding yes
-X11DisplayOffset 10
-PrintMotd no
-PrintLastLog yes
-TCPKeepAlive yes
-PermitUserEnvironment no
-Subsystem sftp /usr/lib/openssh/sftp-server
-SSHEOF
-systemctl restart ssh 2>/dev/null || service ssh restart 2>/dev/null || /etc/init.d/ssh restart 2>/dev/null || true
-"""
+SSH_FIX_SCRIPT = None  # Deprecated; configure_ssh uses an sshd_config.d drop-in.
+
 
 # OS Options for VPS Creation and Reinstall
 OS_OPTIONS = [
@@ -100,6 +79,19 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(f'{BOT_NAME.lower()}_vps_bot')
+
+# Prevent accidental duplicate Discord gateway sessions.
+PROCESS_LOCK_HANDLE = None
+try:
+    import fcntl
+    _lock_path = Path(__file__).resolve().parent / 'bot-process.lock'
+    PROCESS_LOCK_HANDLE = open(_lock_path, 'a+', encoding='utf-8')
+    fcntl.flock(PROCESS_LOCK_HANDLE.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print('Another RGNODES™ bot process is already running; exiting.', file=sys.stderr)
+    raise SystemExit(1)
+except Exception as _lock_error:
+    print(f'Warning: bot process lock unavailable: {_lock_error}', file=sys.stderr)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ROBUST SQLITE DATABASE SYSTEM - PERSISTENT + CRASH SAFE + SILENT SAVES
@@ -830,13 +822,13 @@ async def _port_device_add(container: str, host_port: int, vps_port: int, node_i
     udp_name = f"rgnodes-pf-udp-{host_port}"
     await execute_lxc(
         container,
-        f"config device add {container} {tcp_name} proxy listen=tcp:0.0.0.0:{host_port} connect=tcp:0.0.0.0:{vps_port} bind=host",
+        f"config device add {container} {tcp_name} proxy listen=tcp:0.0.0.0:{host_port} connect=tcp:127.0.0.1:{vps_port} bind=host",
         node_id=node_id,
     )
     try:
         await execute_lxc(
             container,
-            f"config device add {container} {udp_name} proxy listen=udp:0.0.0.0:{host_port} connect=udp:0.0.0.0:{vps_port} bind=host",
+            f"config device add {container} {udp_name} proxy listen=udp:0.0.0.0:{host_port} connect=udp:127.0.0.1:{vps_port} bind=host",
             node_id=node_id,
         )
     except Exception:
@@ -963,10 +955,10 @@ def get_user_forwards(user_id: str) -> List[Dict]:
             conn.close()
 
 
-async def recreate_port_forwards(container_name: str) -> int:
+async def recreate_port_forwards(container_name: str, node_id_override: Optional[int] = None) -> int:
     """Rebuild all persistent proxy devices after a restart/reinstall."""
     async with PORT_OPERATION_LOCK:
-        node_id = find_node_id_for_container(container_name)
+        node_id = int(node_id_override) if node_id_override is not None else find_node_id_for_container(container_name)
         with DB_LOCK:
             conn = get_db()
             try:
@@ -1091,11 +1083,25 @@ def _safe_fromiso(value: str) -> datetime:
         return datetime.max
 
 
+def _parse_gb(value: Any, default: int) -> int:
+    try:
+        return max(1, int(float(str(value).strip().lower().replace('gb', '').strip())))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _parse_cpu(value: Any, default: int) -> int:
+    try:
+        return max(1, int(float(str(value).strip())))
+    except (TypeError, ValueError):
+        return int(default)
+
+
 async def status_presence_task():
     while not bot.is_closed():
         try:
             created, total_slots, running, expired = get_presence_counts()
-            activity = f"{created}/{total_slots} | {running} Running | {expired} Expired"
+            activity = f"🖥️ {created}/{total_slots} | 🟢 {running} Running | ⏰ {expired} Expired"
             await bot.change_presence(activity=discord.Game(name=activity))
         except Exception as e:
             logger.debug(f"Presence update failed: {e}")
@@ -1222,69 +1228,110 @@ printf '127.0.1.1 %s\\n' {shlex.quote(safe)} >> /etc/hosts
 
 
 async def bootstrap_vps_guest(container_name: str, node_id: int):
-    '''Install the requested virtualization, SSH, network and utility packages in the guest.'''
-    script = r'''set -Eeuo pipefail
+    """Install the guest baseline across supported Debian/Ubuntu images.
+
+    Required packages are fail-fast; optional virtualization packages are best-effort
+    because some LXC guests/repositories do not expose them.
+    """
+    script = r'''set -u
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+
+updated=0
 for attempt in 1 2 3 4 5; do
-  if apt update; then break; fi
-  [ "$attempt" -lt 5 ] || exit 1
-  sleep 5
+  if apt update; then updated=1; break; fi
+  sleep $((attempt * 2))
 done
-apt install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virt-manager virtinst sudo openssh-server curl ca-certificates iproute2 procps iputils-ping net-tools
-# Docker is an optional guest capability: install when the distro repository provides it,
-# but never make VPS creation fail just because Docker cannot run inside nested LXC.
-if apt-cache show docker.io >/dev/null 2>&1; then
-  apt install -y docker.io >/dev/null 2>&1 || true
-  systemctl enable --now docker >/dev/null 2>&1 || true
+[ "$updated" -eq 1 ] || exit 10
+
+apt install -y \
+  bash coreutils grep sed gawk \
+  sudo openssh-server openssh-client \
+  curl ca-certificates \
+  iproute2 iputils-ping procps net-tools \
+  python3 python3-pip python3-venv
+
+optional_pkgs=""
+for pkg in qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virt-manager virtinst; do
+  if apt-cache show "$pkg" >/dev/null 2>&1; then
+    optional_pkgs="$optional_pkgs $pkg"
+  fi
+done
+if [ -n "$optional_pkgs" ]; then
+  # shellcheck disable=SC2086
+  apt install -y $optional_pkgs >/dev/null 2>&1 || true
 fi
-mkdir -p /etc/ssh /run/sshd
+
+mkdir -p /etc/ssh/sshd_config.d /run/sshd
 [ -e /etc/ssh/sshd_config ] || touch /etc/ssh/sshd_config
-if systemctl list-unit-files 2>/dev/null | grep -q '^libvirtd\.service'; then
-  systemctl enable --now libvirtd >/dev/null 2>&1 || true
-elif systemctl list-unit-files 2>/dev/null | grep -q '^virtqemud\.service'; then
-  systemctl enable --now virtqemud >/dev/null 2>&1 || true
+chmod 0600 /etc/ssh/sshd_config 2>/dev/null || true
+if ! grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config 2>/dev/null; then
+  printf '\nInclude /etc/ssh/sshd_config.d/*.conf\n' >> /etc/ssh/sshd_config
 fi
-systemctl enable --now ssh >/dev/null 2>&1 || systemctl enable --now sshd >/dev/null 2>&1 || true
+
+if command -v systemctl >/dev/null 2>&1; then
+  if systemctl list-unit-files ssh.service >/dev/null 2>&1; then
+    systemctl enable --now ssh >/dev/null 2>&1 || true
+  elif systemctl list-unit-files sshd.service >/dev/null 2>&1; then
+    systemctl enable --now sshd >/dev/null 2>&1 || true
+  fi
+  if systemctl list-unit-files libvirtd.service >/dev/null 2>&1; then
+    systemctl enable --now libvirtd >/dev/null 2>&1 || true
+  elif systemctl list-unit-files virtqemud.service >/dev/null 2>&1; then
+    systemctl enable --now virtqemud >/dev/null 2>&1 || true
+  fi
+fi
+
 usermod -aG libvirt root >/dev/null 2>&1 || true
 usermod -aG kvm root >/dev/null 2>&1 || true
+
 D='/tmp/sshx-RGNODES™'
 mkdir -p "$D"
 if [ ! -x "$D/sshx" ]; then
-  (cd "$D" && curl -sSf https://sshx.io/get | sh) || (cd "$D" && curl -sSf https://sshx.io/get | sh -s download) || true
+  (cd "$D" && curl -sSf https://sshx.io/get | sh) >/tmp/rgnodes-sshx-install.log 2>&1 || true
+  if [ ! -x "$D/sshx" ]; then
+    (cd "$D" && curl -sSf https://sshx.io/get | sh -s download) >>/tmp/rgnodes-sshx-install.log 2>&1 || true
+  fi
 fi
-chmod +x "$D/sshx" >/dev/null 2>&1 || true
+chmod 0755 "$D/sshx" >/dev/null 2>&1 || true
+command -v sshd >/dev/null 2>&1 && sshd -t >/dev/null 2>&1 || true
 '''
     await _exec_guest_bash(container_name, node_id, script, timeout=900)
 
-
 async def install_anti_mining_guard(container_name: str, node_id: int):
-    '''Install conservative process-based anti-cryptomining protection in every VPS.'''
+    """Install conservative best-effort anti-cryptomining protection in every VPS."""
     if not ANTI_MINING_ENABLED:
         return
-    script = r'''set -Eeuo pipefail
-cat > /usr/local/sbin/rgnodes-mining-guard <<'EOF'
-#!/bin/bash
+    script = r'''set +u
+cat > /usr/local/sbin/rgnodes-mining-guard <<'GUARD'
+#!/usr/bin/env bash
 set +e
-PATTERN='(^|[[:space:]/_-])(xmrig|xmrig-proxy|xmr-stak|cpuminer|cpuminer-multi|minerd|ccminer|cgminer|bfgminer|nbminer|lolminer|t-rex|ethminer|nanominer|rigel|gminer)([[:space:]/_.:-]|$)|stratum\+tcp|stratum\+ssl'
+MINER_NAMES='^(xmrig|xmrig-proxy|xmr-stak|cpuminer|cpuminer-multi|minerd|ccminer|cgminer|bfgminer|nbminer|lolminer|t-rex|ethminer|nanominer|rigel|gminer|teamredminer|phoenixminer)$'
 for proc in /proc/[0-9]*; do
   pid=${proc##*/}
   [ "$pid" = "$$" ] && continue
   [ -r "$proc/cmdline" ] || continue
+  [ -r "$proc/comm" ] || continue
+  comm=$(tr -d '\0\n' < "$proc/comm" 2>/dev/null)
   cmd=$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null)
-  [ -n "$cmd" ] || continue
-  if printf '%s\n' "$cmd" | grep -Eiq -- "$PATTERN"; then
-    case "$cmd" in
-      *rgnodes-mining-guard*|*/systemd*|*sshd*) continue ;;
-    esac
-    kill -TERM "$pid" 2>/dev/null || true
-    sleep 0.2
-    kill -KILL "$pid" 2>/dev/null || true
-    logger -t rgnodes-mining-guard "Blocked suspected cryptominer PID=$pid"
-  fi
+  lower_comm=$(printf '%s' "$comm" | tr '[:upper:]' '[:lower:]')
+  lower_cmd=$(printf '%s' "$cmd" | tr '[:upper:]' '[:lower:]')
+  suspicious=0
+  printf '%s\n' "$lower_comm" | grep -Eq "$MINER_NAMES" && suspicious=1
+  printf '%s\n' "$lower_cmd" | grep -Eq '(^|[[:space:]])(stratum\+tcp|stratum\+ssl|ethashstratum|nicehash)([^[:alnum:]_-]|$)' && suspicious=1
+  [ "$suspicious" -eq 1 ] || continue
+  case "$lower_cmd" in
+    *rgnodes-mining-guard*|*/sshd*|*/systemd*|*/init*|*cloud-init*|*apt*|*dpkg*) continue ;;
+  esac
+  kill -TERM "$pid" 2>/dev/null || true
+  sleep 0.25
+  kill -KILL "$pid" 2>/dev/null || true
+  logger -t rgnodes-mining-guard "Blocked suspected cryptominer pid=$pid comm=$comm" 2>/dev/null || true
 done
-EOF
+GUARD
 chmod 0755 /usr/local/sbin/rgnodes-mining-guard
-cat > /etc/systemd/system/rgnodes-mining-guard.service <<'EOF'
+if command -v systemctl >/dev/null 2>&1; then
+  cat > /etc/systemd/system/rgnodes-mining-guard.service <<'EOF2'
 [Unit]
 Description=RGNODES Anti-Mining Protection
 After=multi-user.target
@@ -1292,27 +1339,34 @@ After=multi-user.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/rgnodes-mining-guard
-EOF
-cat > /etc/systemd/system/rgnodes-mining-guard.timer <<'EOF'
+EOF2
+  cat > /etc/systemd/system/rgnodes-mining-guard.timer <<'EOF2'
 [Unit]
 Description=RGNODES Anti-Mining Protection Timer
 
 [Timer]
 OnBootSec=30s
 OnUnitActiveSec=30s
-Persistent=true
 AccuracySec=5s
+Persistent=true
 Unit=rgnodes-mining-guard.service
 
 [Install]
 WantedBy=timers.target
-EOF
-systemctl daemon-reload
-systemctl enable --now rgnodes-mining-guard.timer >/dev/null 2>&1
-/usr/local/sbin/rgnodes-mining-guard || true
+EOF2
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now rgnodes-mining-guard.timer >/dev/null 2>&1 || true
+else
+  mkdir -p /etc/cron.d
+  printf '*/1 * * * * root /usr/local/sbin/rgnodes-mining-guard >/dev/null 2>&1\n' > /etc/cron.d/rgnodes-mining-guard
+  chmod 0644 /etc/cron.d/rgnodes-mining-guard
+fi
+/usr/local/sbin/rgnodes-mining-guard >/dev/null 2>&1 || true
 '''
-    await _exec_guest_bash(container_name, node_id, script, timeout=120)
-
+    try:
+        await _exec_guest_bash(container_name, node_id, script, timeout=120)
+    except Exception as e:
+        logger.warning(f"Anti-mining guard installation skipped for {container_name}: {e}")
 
 async def start_sshx_session(container_name: str, node_id: int) -> Optional[str]:
     '''Start or reconnect SSHX and return the public session URL.'''
@@ -2392,6 +2446,47 @@ async def protection_repair_task():
             logger.error(f"Protection repair task failed: {e}", exc_info=True)
         await asyncio.sleep(6 * 3600)
 
+
+async def guest_baseline_repair_task():
+    """Periodically repair only missing guest baseline dependencies on running VPS."""
+    await bot.wait_until_ready()
+    await asyncio.sleep(90)
+    required = "bash sudo curl ip ss ps python3 test"
+    while not bot.is_closed():
+        try:
+            for _owner_id, items in list(vps_data.items()):
+                for vps in list(items):
+                    if bool(vps.get('suspended', False)):
+                        continue
+                    container = str(vps.get('container_name') or '').strip()
+                    if not container:
+                        continue
+                    node_id = int(vps.get('node_id', 1))
+                    try:
+                        stats = await asyncio.wait_for(get_container_stats(container, node_id), timeout=10)
+                        if str(stats.get('status', '')).lower() != 'running':
+                            continue
+                        probe = await _exec_guest_bash(
+                            container,
+                            node_id,
+                            "missing=''; for c in bash sudo curl ip ss ps python3; do command -v \"$c\" >/dev/null 2>&1 || missing=\"$missing $c\"; done; test -d /etc/ssh/sshd_config.d || missing=\"$missing sshd-config-dir\"; if [ -n \"$missing\" ]; then printf 'MISSING:%s\\n' \"$missing\"; else printf 'OK\\n'; fi",
+                            timeout=25,
+                        )
+                        if str(probe).strip().startswith('MISSING:'):
+                            logger.warning(f"Guest baseline repair required for {container}: {probe.strip()}")
+                            await bootstrap_vps_guest(container, node_id)
+                            await install_anti_mining_guard(container, node_id)
+                            await recreate_port_forwards(container, node_id_override=node_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.debug(f"Guest baseline repair skipped for {container}: {e}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Guest baseline repair task failed: {e}", exc_info=True)
+        await asyncio.sleep(12 * 3600)
+
 async def expiration_monitor_task():
     await bot.wait_until_ready()
     while not bot.is_closed():
@@ -2404,6 +2499,36 @@ async def expiration_monitor_task():
         await asyncio.sleep(3600)
 
 # Bot events
+async def runtime_self_repair_task():
+    """Low-risk startup repair: sync DB status and restore security/ports."""
+    await bot.wait_until_ready()
+    await asyncio.sleep(15)
+    try:
+        for _owner_id, items in list(vps_data.items()):
+            for vps in list(items):
+                container = str(vps.get('container_name') or '').strip()
+                if not container:
+                    continue
+                node_id = int(vps.get('node_id', 1))
+                try:
+                    stats = await asyncio.wait_for(get_container_stats(container, node_id), timeout=12)
+                    actual = str(stats.get('status', 'unknown')).lower()
+                    if actual in {'running', 'stopped'} and actual != str(vps.get('status', 'stopped')).lower():
+                        vps['status'] = actual
+                        save_vps_data_immediate()
+                    if actual == 'running' and not bool(vps.get('suspended', False)):
+                        await install_anti_mining_guard(container, node_id)
+                        await recreate_port_forwards(container, node_id_override=node_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.debug(f'Runtime self-repair skipped for {container}: {e}')
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error(f'Runtime self-repair failed: {e}', exc_info=True)
+
+
 @bot.event
 async def on_ready():
     global status_task_handle
@@ -2420,6 +2545,10 @@ async def on_ready():
     global protection_task_handle
     if protection_task_handle is None or protection_task_handle.done():
         protection_task_handle = bot.loop.create_task(protection_repair_task(), name="rgnodes_protection_task")
+    if not any(task.get_name() == "rgnodes_runtime_repair_task" for task in asyncio.all_tasks()):
+        bot.loop.create_task(runtime_self_repair_task(), name="rgnodes_runtime_repair_task")
+    if not any(task.get_name() == "rgnodes_guest_repair_task" for task in asyncio.all_tasks()):
+        bot.loop.create_task(guest_baseline_repair_task(), name="rgnodes_guest_repair_task")
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -2429,6 +2558,8 @@ async def on_command_error(ctx, error):
         await ctx.send(embed=create_error_embed("Missing Argument", f"Please check command usage with `{PREFIX}help`."))
     elif isinstance(error, commands.BadArgument):
         await ctx.send(embed=create_error_embed("Invalid Argument", "Please check your input and try again."))
+    elif isinstance(error, commands.CommandInvokeError) and isinstance(error.original, asyncio.TimeoutError):
+        await ctx.send(embed=create_warning_embed("⏱️ Operation Timed Out", "The interactive setup wizard expired after 3 minutes. No new VPS/node was created by the timed-out prompt."))
     elif isinstance(error, commands.CheckFailure):
         error_msg = str(error) if str(error) else "You need admin permissions for this command. Contact support."
         await ctx.send(embed=create_error_embed("Access Denied", error_msg))
@@ -2609,7 +2740,7 @@ async def my_vps(ctx):
             inline=False
         )
 
-    embed.set_footer(text=f"Made by Hopingboyz • VPS Control Panel")
+    embed.set_footer(text=f"⚡ RGNODES™ • VPS Control Panel")
     embed.timestamp = ctx.message.created_at
 
     await ctx.send(embed=embed)
@@ -2809,13 +2940,6 @@ class OSSelectView(discord.ui.View):
                 logger.warning(f"SSH configuration partially failed: {result}")
             await send_progress(interaction, "Creating VPS", 6, 6, "Finalizing database, port forwarding, and user access.")
             
-            # Execute HOST_MOTD command if configured
-            if HOST_MOTD:
-                try:
-                    await _exec_guest_bash(container_name, self.node_id, HOST_MOTD, timeout=300)
-                    logger.info(f"HOST_MOTD executed on {container_name}")
-                except Exception as e:
-                    logger.warning(f"HOST_MOTD execution failed for {container_name}: {e}")
             
             config_str = f"{self.ram}GB RAM / {self.cpu} CPU / {self.disk}GB Disk"
             vps_info = {
@@ -2867,8 +2991,12 @@ class OSSelectView(discord.ui.View):
             except Exception as e:
                 logger.warning(f"Could not allocate port for user {user_id}: {e}")
             
-            if not save_vps_data_immediate():
-                raise RuntimeError("VPS was created, but its database record could not be persisted safely. Deployment was rolled back.")
+            try:
+                save_vps_data_immediate()
+            except Exception as persist_error:
+                raise RuntimeError(
+                    f"VPS was created, but its database record could not be persisted safely: {persist_error}"
+                ) from persist_error
             record_persisted = True
             logger.info(f"   ✅ VPS database record persisted")
             
@@ -3111,11 +3239,6 @@ class ReinstallOSSelectView(discord.ui.View):
                 raise RuntimeError(f'SSH validation failed on replacement VPS: {ssh_result}')
             await _exec_guest_bash(staging_name, self.node_id, "sshd -t", timeout=30)
             await _exec_guest_bash(staging_name, self.node_id, "test -x /usr/local/sbin/rgnodes-mining-guard && systemctl is-enabled rgnodes-mining-guard.timer >/dev/null 2>&1 || true", timeout=30)
-            if HOST_MOTD:
-                try:
-                    await _exec_guest_bash(staging_name, self.node_id, HOST_MOTD, timeout=300)
-                except Exception as e:
-                    logger.warning(f'HOST_MOTD execution failed during reinstall validation for {staging_name}: {e}')
 
             # Verify the instance can execute commands before any destructive swap.
             await _exec_guest_bash(staging_name, self.node_id, 'true', timeout=30)
@@ -3658,7 +3781,8 @@ class ManageView(discord.ui.View):
                         ssh_port = await create_port_forward(self.owner_id, container_name, 22, node_id)
                     command = f"ssh root@{YOUR_SERVER_IP} -p {ssh_port}" if ssh_port else "SSH forwarding unavailable"
                     access = create_info_embed("🌐 RGNODES™ Remote Access", f"`{container_name}` • `{VPS_HOSTNAME}`")
-                    add_field(access, "🌐 SSHX", f"{f'<{sshx_url}>\\n🟢 Tunnel Active' if sshx_url else '🟡 SSHX unavailable — use Reconnect Tunnel again.'}", False)
+                    sshx_display = f"<{sshx_url}>\n🟢 Tunnel Active" if sshx_url else "🟡 SSHX unavailable — use Reconnect Tunnel again."
+                    add_field(access, "🌐 SSHX", sshx_display, False)
                     add_field(access, "💻 SSH", f"```bash\n{command}\n```\nUsername: `root`\nPassword: `{target_vps.get('root_password') or 'not available'}`", False)
                     try:
                         owner = await bot.fetch_user(int(self.owner_id))
@@ -3875,7 +3999,7 @@ async def get_node_status(node_id: int) -> str:
         return "🟢 Online (Local)"
     # Remote nodes - check connectivity but don't spam errors
     try:
-        response = await asyncio.to_thread(requests.get, f"{node['url']}/api/ping", params={'api_key': node['api_key']}, timeout=5)
+        response = await asyncio.to_thread(requests.get, str(node['url']).rstrip('/') + '/api/ping', params={'api_key': node['api_key']}, timeout=5)
         if response.status_code == 200:
             return "🟢 Online"
         else:
@@ -4074,12 +4198,12 @@ async def vps_list(ctx, node_id: int = 1):
             )
             chunk_text = "\n".join(chunk)
             add_field(page_embed, "📋 **VPS List**", f"```{chunk_text}```", False)
-            page_embed.set_footer(text=f"Made by Hopingboyz • {len(vps_info)} VPS shown")
+            page_embed.set_footer(text=f"⚡ RGNODES™ • {len(vps_info)} VPS shown")
             await ctx.send(embed=page_embed)
     else:
         add_field(embed, "📋 **VPS List**", "No deployments yet. Launch one! 🚀", False)
 
-    embed.set_footer(text=f"Made by Hopingboyz • Total: {len(vps_info)} VPS")
+    embed.set_footer(text=f"⚡ RGNODES™ • Total: {len(vps_info)} VPS")
     await ctx.send(embed=embed)
 
 @bot.command(name='list-all')
@@ -4783,7 +4907,7 @@ async def system_status(ctx):
         else:
             # Check remote node status
             try:
-                response = await asyncio.to_thread(requests.get, f"{node['url']}/api/ping", params={'api_key': node['api_key']}, timeout=5)
+                response = await asyncio.to_thread(requests.get, str(node['url']).rstrip('/') + '/api/ping', params={'api_key': node['api_key']}, timeout=5)
                 if response.status_code == 200:
                     status = "🟢 Online"
                     running_nodes += 1
@@ -4914,7 +5038,7 @@ async def system_status(ctx):
     add_field(embed, "🏥 System Health", health_status, False)
     
     # Footer with current time
-    embed.set_footer(text=f"Made by Hopingboyz • System Status • Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+    embed.set_footer(text=f"⚡ RGNODES™ • System Status • Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                     icon_url=BOT_ICON_URL)
     
     await ctx.send(embed=embed)
@@ -4936,7 +5060,7 @@ async def status_summary(ctx):
             running_nodes += 1
         else:
             try:
-                response = await asyncio.to_thread(requests.get, f"{node['url']}/api/ping", params={'api_key': node['api_key']}, timeout=3)
+                response = await asyncio.to_thread(requests.get, str(node['url']).rstrip('/') + '/api/ping', params={'api_key': node['api_key']}, timeout=3)
                 if response.status_code == 200:
                     running_nodes += 1
             except:
@@ -5152,7 +5276,7 @@ async def user_info(ctx, user: discord.Member):
             inline=False
         )
 
-    embed.set_footer(text="Made by Hopingboyz • User Resource Dashboard")
+    embed.set_footer(text="⚡ RGNODES™ • User Resource Dashboard")
     embed.timestamp = ctx.message.created_at
 
     await ctx.send(embed=embed)
@@ -5306,7 +5430,7 @@ async def server_stats(ctx):
         inline=True
     )
 
-    embed.set_footer(text="Made by Hopingboyz • Real-Time Monitoring")
+    embed.set_footer(text="⚡ RGNODES™ • Real-Time Monitoring")
     embed.timestamp = ctx.message.created_at
 
     await ctx.send(embed=embed)
@@ -5348,7 +5472,7 @@ async def vps_info(ctx, container_name: str = None):
         for idx, chunk in enumerate(chunks, 1):
             embed = create_embed(f"🖥️ All VPS (Part {idx}/{len(chunks)})", f"Complete list of all VPS deployments with expiration status", 0x2ecc71)
             add_field(embed, "VPS Inventory", chunk, False)
-            embed.set_footer(text=f"Made by Hopingboyz • VPS Information System")
+            embed.set_footer(text=f"⚡ RGNODES™ • VPS Information System")
             await ctx.send(embed=embed)
     else:
         found_vps = None
@@ -5372,7 +5496,11 @@ async def vps_info(ctx, container_name: str = None):
         if found_vps.get('suspended', False):
             status_color = 0xffaa00
         elif found_vps.get('expiration_date'):
-            expiration_dt = datetime.fromisoformat(found_vps['expiration_date'])
+            expiration_dt = _safe_fromiso(found_vps['expiration_date'])
+            if expiration_dt == datetime.max:
+                add_field(embed, 'Status', '⚠️ INVALID EXPIRATION DATA', True)
+                await ctx.send(embed=embed)
+                return
             days_remaining = (expiration_dt - datetime.now()).days
             if days_remaining < 0:
                 status_color = 0xff3366
@@ -5456,7 +5584,7 @@ async def vps_info(ctx, container_name: str = None):
         # OS information
         add_field(embed, "🐧 Operating System", f"`{found_vps.get('os_version', 'ubuntu:22.04')}`", True)
         
-        embed.set_footer(text=f"Made by Hopingboyz • VPS Information System • Container: {container_name}")
+        embed.set_footer(text=f"⚡ RGNODES™ • VPS Information System • Container: {container_name}")
         await ctx.send(embed=embed)
 
 @bot.command(name='restart-vps')
@@ -5480,6 +5608,7 @@ async def restart_vps(ctx, container_name: str):
                     save_vps_data_immediate()
                     break
         await apply_internal_permissions(container_name, node_id)
+        await install_anti_mining_guard(container_name, node_id)
         await recreate_port_forwards(container_name)
         await ctx.send(embed=create_success_embed("VPS Restarted", f"VPS `{container_name}` has been restarted successfully!"))
     except Exception as e:
@@ -5520,8 +5649,6 @@ async def stop_all_vps(ctx):
                 failed = []
                 for user_id, vps_list in list(vps_data.items()):
                     for vps in list(vps_list):
-                        if vps.get('suspended', False):
-                            continue
                         container = str(vps.get('container_name') or '')
                         if not container:
                             continue
@@ -5671,7 +5798,11 @@ async def clone_vps(ctx, container_name: str, new_name: str = None):
         await apply_lxc_config(new_name, node_id)
         await execute_lxc(new_name, f"start {new_name}", node_id=node_id)
         await apply_internal_permissions(new_name, node_id)
-        await recreate_port_forwards(new_name)
+        await safe_guest_install(new_name, node_id)
+        clone_password = generate_strong_password()
+        clone_ssh_ok, clone_ssh_result = await configure_ssh(new_name, node_id, clone_password)
+        if not clone_ssh_ok:
+            raise RuntimeError(f'Cloned VPS SSH configuration failed: {clone_ssh_result}')
         if user_id not in vps_data:
             vps_data[user_id] = []
         new_vps = found_vps.copy()
@@ -5683,7 +5814,7 @@ async def clone_vps(ctx, container_name: str, new_name: str = None):
         new_vps['created_at'] = datetime.now().isoformat()
         new_vps['shared_with'] = []
         new_vps['id'] = None
-        new_vps['vmid'] = None
+        new_vps['vmid'] = reserve_vps_vmid()
         vps_data[user_id].append(new_vps)
         if not save_vps_data_immediate():
             vps_data[user_id].remove(new_vps)
@@ -5702,34 +5833,21 @@ async def clone_vps(ctx, container_name: str, new_name: str = None):
 @bot.command(name='migrate-vps')
 @is_admin()
 async def migrate_vps(ctx, container_name: str, target_node_id: int):
-    node_id = find_node_id_for_container(container_name)
+    """Safely refuse unsupported cross-node migration rather than risking source loss."""
+    source_node_id = find_node_id_for_container(container_name)
+    source_node = get_node(source_node_id)
     target_node = get_node(target_node_id)
-    if not target_node:
-        await ctx.send(embed=create_error_embed("Invalid Node", "Target node not found."))
+    if not source_node or not target_node:
+        await ctx.send(embed=create_error_embed("🌐 Invalid Node", "Source or target node does not exist."))
         return
-    await ctx.send(embed=create_info_embed("Migrating VPS", f"Migrating VPS `{container_name}` to node {target_node['name']}..."))
-    try:
-        await execute_lxc(container_name, f"stop {container_name}", node_id=node_id)
-        temp_name = f"{BOT_NAME.lower()}-{container_name}-temp-{int(time.time())}"
-        target_pool = await resolve_storage_pool(target_node_id)
-        await execute_lxc(container_name, f"copy {container_name} {temp_name} -s {shlex.quote(target_pool)}", node_id=target_node_id)
-        await execute_lxc(container_name, f"delete {container_name} --force", node_id=node_id)
-        await execute_lxc(temp_name, f"rename {temp_name} {container_name}", node_id=target_node_id)
-        await apply_lxc_config(container_name, target_node_id)
-        await execute_lxc(container_name, f"start {container_name}", node_id=target_node_id)
-        await apply_internal_permissions(container_name, target_node_id)
-        await recreate_port_forwards(container_name)
-        for user_id, vps_list in vps_data.items():
-            for vps in vps_list:
-                if vps['container_name'] == container_name:
-                    vps['node_id'] = target_node_id
-                    vps['status'] = 'running'
-                    vps['suspended'] = False
-                    save_vps_data_immediate()
-                    break
-        await ctx.send(embed=create_success_embed("VPS Migrated", f"Successfully migrated VPS `{container_name}` to node {target_node['name']}"))
-    except Exception as e:
-        await ctx.send(embed=create_error_embed("Migration Failed", f"Error: {str(e)}"))
+    if int(source_node_id) == int(target_node_id):
+        await ctx.send(embed=create_warning_embed("🌐 Same Node", "The VPS is already on the selected node."))
+        return
+    await ctx.send(embed=create_warning_embed(
+        "🛡️ Migration Blocked Safely",
+        "Cross-node migration is disabled with the current node-agent contract because the target cannot safely access the source container.\n\n"
+        "The previous implementation could stop the source before the copy was actually possible. No VPS data was changed.",
+    ))
 
 @bot.command(name='vps-stats')
 @is_admin()
@@ -5783,7 +5901,7 @@ async def node_check(ctx, node_id: int):
         
         # Check remote API endpoint
         try:
-            test_response = await asyncio.to_thread(requests.get, f"{node['url']}/api/ping", params={'api_key': node['api_key']}, timeout=5)
+            test_response = await asyncio.to_thread(requests.get, str(node['url']).rstrip('/') + '/api/ping', params={'api_key': node['api_key']}, timeout=5)
             add_field(embed, "🔌 API Endpoint", f"✅ Reachable\nURL: {node['url']}", False)
         except Exception as e:
             add_field(embed, "🔌 API Endpoint", f"❌ Unreachable\nError: {str(e)[:200]}", False)
@@ -5890,7 +6008,7 @@ async def vps_password(ctx, container_name: str = None):
             embed = create_embed(f"🔐 VPS Root Passwords (Part {idx}/{len(chunks)})", "Root passwords for all VPS", 0xff6b6b)
             add_field(embed, "Passwords", chunk, False)
             add_field(embed, "⚠️ Security Notice", "These passwords are sensitive. Do not share them publicly.", False)
-            embed.set_footer(text=f"Made by Hopingboyz • Password Management")
+            embed.set_footer(text=f"⚡ RGNODES™ • Password Management")
             await ctx.send(embed=embed)
     else:
         # Show password for specific VPS
@@ -5919,7 +6037,7 @@ async def vps_password(ctx, container_name: str = None):
             add_field(embed, "🔐 Password", f"`{password}`", False)
             add_field(embed, "Usage", f"SSH as `root` with this password", False)
         
-        embed.set_footer(text=f"Made by Hopingboyz • Password Information")
+        embed.set_footer(text=f"⚡ RGNODES™ • Password Information")
         await ctx.send(embed=embed)
 
 @bot.command(name='suspend-vps')
@@ -5981,6 +6099,7 @@ async def unsuspend_vps(ctx, container_name: str):
                         if "already running" not in msg and "is running" not in msg:
                             raise
                     await apply_internal_permissions(container_name, node_id)
+                    await install_anti_mining_guard(container_name, node_id)
                     await recreate_port_forwards(container_name)
                     vps['suspended'] = False
                     vps['status'] = 'running'
@@ -6582,6 +6701,7 @@ async def process_vps_renewal(vps: Dict[str, Any], requested_days: int = None, u
             vps['status'] = 'running'
             vps['suspended'] = False
             await apply_internal_permissions(container, node_id)
+            await install_anti_mining_guard(container, node_id)
             await recreate_port_forwards(container)
         except Exception as e:
             return False, f'The VPS could not be safely restarted, so renewal was not committed: `{str(e)[:600]}`'
@@ -6627,7 +6747,14 @@ async def renew_user(ctx, container_name: str = None):
 @bot.command(name='renew-vps')
 @is_admin()
 async def renew_vps(ctx, container_name: str, additional_days: int = None):
-    days = int(additional_days or VPS_RENEWAL_DAYS)
+    try:
+        days = int(additional_days if additional_days is not None else VPS_RENEWAL_DAYS)
+    except (TypeError, ValueError):
+        await ctx.send(embed=create_error_embed('Invalid Days', 'Renewal days must be a positive integer.'))
+        return
+    if days <= 0:
+        await ctx.send(embed=create_error_embed('Invalid Days', 'Renewal days must be greater than 0.'))
+        return
     uid, idx, vps = find_vps_record(container_name)
     if not vps:
         await ctx.send(embed=create_error_embed('VPS Not Found', f'No VPS found with ID/name: `{container_name}`'))
@@ -6642,6 +6769,81 @@ async def renew_vps(ctx, container_name: str, additional_days: int = None):
         await owner.send(embed=create_success_embed('⏰ VPS Renewed', message))
     except Exception:
         pass
+
+
+@bot.command(name='dm-mass')
+@is_admin()
+async def dm_mass(ctx, *, message: str = None):
+    """Send an admin announcement only to users who currently own managed VPS records."""
+    message = (message or '').strip()
+    if not message:
+        await ctx.send(embed=create_error_embed('📢 Message Required', f'Usage: `{PREFIX}dm-mass <message>`'))
+        return
+    if len(message) > 1800:
+        await ctx.send(embed=create_error_embed('📏 Message Too Long', 'Keep the announcement below 1800 characters.'))
+        return
+
+    recipients = []
+    seen = set()
+    for owner_id, items in vps_data.items():
+        if not items:
+            continue
+        try:
+            uid = int(owner_id)
+        except (TypeError, ValueError):
+            continue
+        if uid not in seen:
+            seen.add(uid)
+            recipients.append(uid)
+
+    if not recipients:
+        await ctx.send(embed=create_warning_embed('📢 No VPS Users', 'No users currently own a managed VPS.'))
+        return
+
+    confirm = create_warning_embed(
+        '📢 VPS User Announcement',
+        f'This will DM **{len(recipients)}** current VPS owner(s).\n\n**Message:**\n{message}\n\nContinue?',
+    )
+
+    class DMConfirmView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=60)
+            self.confirmed = False
+
+        @discord.ui.button(label='✅ Send', style=discord.ButtonStyle.secondary)
+        async def send_now(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if str(interaction.user.id) != str(ctx.author.id):
+                await interaction.response.send_message(embed=create_error_embed('⛔ Access Denied', 'Only the admin who started this announcement can confirm it.'), ephemeral=True)
+                return
+            self.confirmed = True
+            await interaction.response.defer()
+            self.stop()
+            sent = failed = 0
+            announcement = create_info_embed('📢 RGNODES™ Announcement', message)
+            add_field(announcement, 'ℹ️ Scope', 'Sent only to users with a managed VPS record.', False)
+            for uid in recipients:
+                try:
+                    user = await bot.fetch_user(uid)
+                    await user.send(embed=announcement)
+                    sent += 1
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
+                    failed += 1
+                    logger.warning(f'DM mass delivery failed for {uid}: {e}')
+                await asyncio.sleep(1.0)
+            await interaction.followup.send(embed=create_success_embed(
+                '📨 Announcement Complete',
+                f'✅ Sent: **{sent}**\n⚠️ Failed/blocked: **{failed}**\n👥 Eligible: **{len(recipients)}**',
+            ))
+
+        @discord.ui.button(label='❌ Cancel', style=discord.ButtonStyle.secondary)
+        async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if str(interaction.user.id) != str(ctx.author.id):
+                await interaction.response.send_message(embed=create_error_embed('⛔ Access Denied', 'Only the admin who started this announcement can cancel it.'), ephemeral=True)
+                return
+            await interaction.response.edit_message(embed=create_info_embed('📢 Announcement Cancelled', 'No DMs were sent.'), view=None)
+            self.stop()
+
+    await ctx.send(embed=confirm, view=DMConfirmView())
 
 
 @bot.command(name='sshx')
@@ -6700,7 +6902,8 @@ async def sshx_command(ctx, container_name: str = None):
         access = create_success_embed("🌐 RGNODES™ SSHX Connected", f"Your VPS `{container}` is ready for remote access.")
         add_field(access, "🖥️ VPS", f"VMID: `{target.get('vmid') or target.get('id')}`\nHostname: `{VPS_HOSTNAME}`\nNode: `{(get_node(node_id) or {}).get('name', 'Unknown')}`", False)
         add_field(access, "💻 SSH", f"```bash\n{command}\n```\nUsername: `root`\nPassword: `{target.get('root_password') or 'not available'}`", False)
-        add_field(access, "🌐 SSHX", f"{f'<{sshx_url}>' if sshx_url else '⚠️ SSHX session URL was not returned.'}\nStatus: {'🟢 Active' if sshx_url else '🟡 Reconnect required'}", False)
+        sshx_display = f"<{sshx_url}>\n🟢 Active" if sshx_url else "⚠️ SSHX session URL was not returned.\n🟡 Reconnect required"
+        add_field(access, "🌐 SSHX", sshx_display, False)
         add_field(access, "🔒 Security", "Never share your root password or SSHX URL publicly.", False)
         try:
             recipient = await bot.fetch_user(int(target_user_id))
@@ -6758,8 +6961,7 @@ async def check_expiration(ctx, container_name: str = None):
             else:
                 status = "🟢 ACTIVE"
                 color = 0x00ff88
-            
-            embed.color = color
+
             add_field(embed, "Status", status, True)
             add_field(embed, "Expiration Date", expiration_dt.strftime('%Y-%m-%d %H:%M:%S'), True)
             add_field(embed, "Days Remaining", str(max(0, days_remaining)), True)
@@ -6872,7 +7074,7 @@ async def quick_help(ctx):
             f"• `{PREFIX}serverstats` - System overview\n"
             f"• `{PREFIX}suspend-vps <container> <reason>` - Suspend VPS", False)
     
-    embed.set_footer(text=f"Made by Hopingboyz • Use {PREFIX}help for complete command list")
+    embed.set_footer(text=f"⚡ RGNODES™ • Use {PREFIX}help for complete command list")
     await ctx.send(embed=embed)
 
 @bot.command(name='help-search')
@@ -6927,7 +7129,7 @@ async def help_search(ctx, *, search_term: str = None):
     if len(matches) > 15:
         add_field(embed, "Note", f"Showing 15 of {len(matches)} matches. Try a more specific search.", False)
     
-    embed.set_footer(text=f"Made by Hopingboyz • Use {PREFIX}help for complete list")
+    embed.set_footer(text=f"⚡ RGNODES™ • Use {PREFIX}help for complete list")
     await ctx.send(embed=embed)    
 
 @bot.command(name='node')
@@ -6937,22 +7139,22 @@ async def node_cmd(ctx, sub: str, *args):
         await ctx.send("Enter node name:")
         def check(m):
             return m.author == ctx.author and m.channel == ctx.channel
-        name = (await bot.wait_for('message', check=check)).content.strip()
+        name = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip()
         await ctx.send("Enter location:")
-        location = (await bot.wait_for('message', check=check)).content.strip()
+        location = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip()
         await ctx.send("Enter total VPS capacity:")
-        total_vps_str = (await bot.wait_for('message', check=check)).content.strip()
+        total_vps_str = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip()
         try:
             total_vps = int(total_vps_str)
         except ValueError:
             await ctx.send(embed=create_error_embed("Invalid Input", "Total VPS must be an integer."))
             return
         await ctx.send("Enter tags (comma separated):")
-        tags_str = (await bot.wait_for('message', check=check)).content.strip()
+        tags_str = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip()
         tags = [t.strip() for t in tags_str.split(',') if t.strip()]
         tags_json = json.dumps(tags)
         await ctx.send("Enter node URL (e.g., http://ip:port or https://ip:port) or leave blank for local:")
-        url_str = (await bot.wait_for('message', check=check)).content.strip()
+        url_str = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip()
         
         # Normalize URL if provided
         if url_str:
@@ -6963,7 +7165,7 @@ async def node_cmd(ctx, sub: str, *args):
             url = None
         
         is_local = 1 if not url else 0
-        api_key = None if is_local else ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=32))
+        api_key = None if is_local else secrets.token_hex(16)
         conn = get_db()
         cur = conn.cursor()
         try:
@@ -6987,7 +7189,7 @@ async def node_cmd(ctx, sub: str, *args):
             status = "Local" if n['is_local'] else "Down"
             if not n['is_local']:
                 try:
-                    response = await asyncio.to_thread(requests.get, f"{n['url']}/api/ping", params={'api_key': n['api_key']}, timeout=5)
+                    response = await asyncio.to_thread(requests.get, str(n['url']).rstrip('/') + '/api/ping', params={'api_key': n['api_key']}, timeout=5)
                     status = "Up" if response.status_code == 200 else "Down"
                 except:
                     pass
@@ -7012,29 +7214,29 @@ async def node_cmd(ctx, sub: str, *args):
         await ctx.send(f"Editing node {node['name']}. Enter new name ( . to skip):")
         def check(m):
             return m.author == ctx.author and m.channel == ctx.channel
-        new_name = (await bot.wait_for('message', check=check)).content.strip()
+        new_name = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip()
         if new_name != '.':
             node['name'] = new_name
         await ctx.send("New location ( . to skip):")
-        new_loc = (await bot.wait_for('message', check=check)).content.strip()
+        new_loc = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip()
         if new_loc != '.':
             node['location'] = new_loc
         await ctx.send("New total VPS capacity ( . to skip):")
-        new_total = (await bot.wait_for('message', check=check)).content.strip()
+        new_total = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip()
         if new_total != '.':
             node['total_vps'] = int(new_total)
         await ctx.send("New tags (comma separated, . to skip):")
-        new_tags = (await bot.wait_for('message', check=check)).content.strip()
+        new_tags = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip()
         if new_tags != '.':
             node['tags'] = [t.strip() for t in new_tags.split(',') if t.strip()]
         
         # NEW: Add conversion option between Local and Dynamic
         if node['is_local']:
             await ctx.send("Convert Local Node to Dynamic URL-based Node? (y/n):")
-            convert = (await bot.wait_for('message', check=check)).content.strip().lower()
+            convert = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip().lower()
             if convert == 'y':
                 await ctx.send("Enter node URL (e.g., http://ip:port or https://ip:port):")
-                url_str = (await bot.wait_for('message', check=check)).content.strip()
+                url_str = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip()
                 if not url_str:
                     await ctx.send(embed=create_error_embed("Error", "URL cannot be empty for dynamic node."))
                     return
@@ -7045,11 +7247,11 @@ async def node_cmd(ctx, sub: str, *args):
                 
                 node['url'] = url_str
                 node['is_local'] = 0
-                node['api_key'] = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=32))
+                node['api_key'] = secrets.token_hex(16)
                 await ctx.send(f"✅ Node converted to Dynamic!\n\n**URL:** `{url_str}`\n**Generated API Key:** `{node['api_key']}`\n\n**Setup Command:**\n```\npython node-agent.py --api_key={node['api_key']} --port=PORT\n```")
         else:
             await ctx.send("Convert Dynamic Node to Local? (y/n):")
-            convert = (await bot.wait_for('message', check=check)).content.strip().lower()
+            convert = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip().lower()
             if convert == 'y':
                 node['url'] = None
                 node['api_key'] = None
@@ -7057,16 +7259,16 @@ async def node_cmd(ctx, sub: str, *args):
                 await ctx.send("✅ Node converted to Local!")
             else:
                 await ctx.send("New URL ( . to skip):")
-                new_url = (await bot.wait_for('message', check=check)).content.strip()
+                new_url = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip()
                 if new_url != '.':
                     # Normalize URL - add http:// if not present
                     if not new_url.startswith('http://') and not new_url.startswith('https://'):
                         new_url = f'http://{new_url}'
                     node['url'] = new_url
                 await ctx.send("Regenerate API key? (y/n):")
-                regen = (await bot.wait_for('message', check=check)).content.strip().lower()
+                regen = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip().lower()
                 if regen == 'y':
-                    node['api_key'] = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=32))
+                    node['api_key'] = secrets.token_hex(16)
         
         conn = get_db()
         cur = conn.cursor()
@@ -7267,11 +7469,11 @@ async def node_cmd(ctx, sub: str, *args):
             add_field(embed, "RAM Usage", f"{ram_usage:.1f}%", True)
         else:
             try:
-                response = await asyncio.to_thread(requests.get, f"{node['url']}/api/ping", params={'api_key': node['api_key']}, timeout=5)
+                response = await asyncio.to_thread(requests.get, str(node['url']).rstrip('/') + '/api/ping', params={'api_key': node['api_key']}, timeout=5)
                 if response.status_code == 200:
                     status = "🟢 Online"
                     try:
-                        stats_response = await asyncio.to_thread(requests.get, f"{node['url']}/api/get_host_stats", 
+                        stats_response = await asyncio.to_thread(requests.get, str(node['url']).rstrip('/') + '/api/get_host_stats', 
                                                     params={'api_key': node['api_key']}, 
                                                     timeout=5)
                         if stats_response.status_code == 200:
@@ -7353,7 +7555,7 @@ async def node_cmd(ctx, sub: str, *args):
                 await inter.response.defer()
                 
                 # Generate new API key
-                new_api_key = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=32))
+                new_api_key = secrets.token_hex(16)
                 
                 # Update database
                 conn = get_db()
