@@ -22,6 +22,7 @@ import re
 import sys
 from dotenv import load_dotenv
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Load environment variables from .env file
 load_dotenv()
@@ -245,6 +246,7 @@ def init_db():
                     cur.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
             ensure_column("nodes", "last_updated", "last_updated TEXT")
+            ensure_column("nodes", "public_host", "public_host TEXT DEFAULT NULL")
             ensure_column("vps", "os_version", "os_version TEXT DEFAULT 'ubuntu:22.04'")
             ensure_column("vps", "node_id", "node_id INTEGER DEFAULT 1")
             ensure_column("vps", "expiration_date", "expiration_date TEXT DEFAULT NULL")
@@ -260,7 +262,39 @@ def init_db():
                     reserved_at TEXT NOT NULL
                 )
             """)
-            cur.execute("UPDATE vps SET vmid = id WHERE vmid IS NULL")
+            # Repair legacy NULL/duplicate VMIDs before creating the unique index.
+            # Existing records are never deleted; only conflicting VMIDs are re-assigned.
+            existing_max = int(cur.execute("SELECT COALESCE(MAX(vmid), 0) FROM vps").fetchone()[0] or 0)
+            seq_row = cur.execute("SELECT seq FROM sqlite_sequence WHERE name = 'vps_vmid_sequence'").fetchone()
+            current_seq = int(seq_row[0]) if seq_row and seq_row[0] is not None else 0
+            if existing_max > current_seq:
+                if seq_row is None:
+                    cur.execute("INSERT INTO vps_vmid_sequence (reserved_at) VALUES (CURRENT_TIMESTAMP)")
+                cur.execute("UPDATE sqlite_sequence SET seq = ? WHERE name = 'vps_vmid_sequence'", (existing_max,))
+
+            # Clear NULLs first; then repair duplicate values while retaining the first
+            # (oldest SQLite row id) as the canonical VMID.
+            cur.execute("UPDATE vps SET vmid = NULL WHERE vmid IS NULL OR vmid <= 0")
+            duplicate_rows = cur.execute("""
+                SELECT vmid FROM vps
+                WHERE vmid IS NOT NULL
+                GROUP BY vmid HAVING COUNT(*) > 1
+            """).fetchall()
+            for dup in duplicate_rows:
+                vmid_value = int(dup[0])
+                rows = cur.execute(
+                    "SELECT id FROM vps WHERE vmid = ? ORDER BY id", (vmid_value,)
+                ).fetchall()
+                for extra in rows[1:]:
+                    cur.execute("UPDATE vps SET vmid = NULL WHERE id = ?", (int(extra[0]),))
+
+            # Assign a fresh sequence value to every record that still has no VMID.
+            missing_ids = cur.execute("SELECT id FROM vps WHERE vmid IS NULL ORDER BY id").fetchall()
+            for row in missing_ids:
+                cur.execute("INSERT INTO vps_vmid_sequence (reserved_at) VALUES (CURRENT_TIMESTAMP)")
+                new_vmid = int(cur.lastrowid)
+                cur.execute("UPDATE vps SET vmid = ? WHERE id = ?", (new_vmid, int(row[0])))
+
             cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_vps_vmid ON vps(vmid)")
             max_vmid = int(cur.execute("SELECT COALESCE(MAX(vmid), 0) FROM vps").fetchone()[0] or 0)
             seq_row = cur.execute("SELECT seq FROM sqlite_sequence WHERE name = 'vps_vmid_sequence'").fetchone()
@@ -310,6 +344,11 @@ def init_db():
 
             # Backfill timestamp columns for migrated rows.
             cur.execute("UPDATE nodes SET last_updated = COALESCE(last_updated, CURRENT_TIMESTAMP)")
+            # Backfill the local node's user-facing host from the bot configuration.
+            cur.execute(
+                "UPDATE nodes SET public_host = COALESCE(NULLIF(TRIM(public_host), ''), ?) WHERE is_local = 1",
+                (str(YOUR_SERVER_IP).strip(),),
+            )
             cur.execute("UPDATE vps SET last_modified = COALESCE(last_modified, CURRENT_TIMESTAMP)")
             cur.execute("UPDATE port_allocations SET last_modified = COALESCE(last_modified, CURRENT_TIMESTAMP)")
             cur.execute("UPDATE port_forwards SET last_modified = COALESCE(last_modified, CURRENT_TIMESTAMP)")
@@ -399,6 +438,7 @@ def get_nodes() -> List[Dict]:
                 except (TypeError, ValueError, json.JSONDecodeError):
                     node["tags"] = []
                 node["is_local"] = int(node.get("is_local", 1)) == 1
+                node["public_host"] = node_public_host(node)
                 nodes.append(node)
             return nodes
         finally:
@@ -423,9 +463,48 @@ def get_node(node_id: int) -> Optional[Dict]:
             except (TypeError, ValueError, json.JSONDecodeError):
                 node["tags"] = []
             node["is_local"] = int(node.get("is_local", 1)) == 1
+            node["public_host"] = node_public_host(node)
             return node
         finally:
             conn.close()
+
+
+def normalize_public_host(value: Optional[str]) -> str:
+    """Normalize an IP/hostname/URL into a host-only value for user-facing access."""
+    raw = str(value or '').strip()
+    if not raw or raw == '.':
+        return ''
+    candidate = raw
+    if '://' not in candidate:
+        candidate = '//' + candidate
+    try:
+        parsed = urlsplit(candidate)
+        host = parsed.hostname or ''
+    except ValueError:
+        host = ''
+    if not host:
+        host = raw.split('/', 1)[0].strip().strip('[]')
+    return host[:253]
+
+
+def node_public_host(node: Optional[Dict[str, Any]]) -> str:
+    """Return the public host used in SSH/SSHX instructions for a node."""
+    if not node:
+        return normalize_public_host(YOUR_SERVER_IP)
+    explicit = normalize_public_host(node.get('public_host'))
+    if explicit:
+        return explicit
+    if bool(node.get('is_local')):
+        return normalize_public_host(YOUR_SERVER_IP)
+    return normalize_public_host(node.get('url')) or normalize_public_host(YOUR_SERVER_IP)
+
+
+def ssh_host_literal(host: str) -> str:
+    """Format an IPv6 literal safely for an SSH command."""
+    host = normalize_public_host(host)
+    if ':' in host and not host.startswith('['):
+        return f'[{host}]'
+    return host
 
 
 def _decode_vps_row(row) -> Dict[str, Any]:
@@ -504,11 +583,18 @@ def get_vps_data() -> Dict[str, List[Dict[str, Any]]]:
 
 
 def reserve_vps_vmid() -> int:
-    """Reserve a globally unique persistent VMID."""
+    """Reserve a globally unique persistent VMID and heal a lagging sequence first."""
     with DB_LOCK:
         conn = get_db()
         try:
             cur = conn.cursor()
+            max_vmid = int(cur.execute("SELECT COALESCE(MAX(vmid), 0) FROM vps").fetchone()[0] or 0)
+            seq_row = cur.execute("SELECT seq FROM sqlite_sequence WHERE name = 'vps_vmid_sequence'").fetchone()
+            current_seq = int(seq_row[0]) if seq_row and seq_row[0] is not None else 0
+            if max_vmid > current_seq:
+                if seq_row is None:
+                    cur.execute("INSERT INTO vps_vmid_sequence (reserved_at) VALUES (CURRENT_TIMESTAMP)")
+                cur.execute("UPDATE sqlite_sequence SET seq = ? WHERE name = 'vps_vmid_sequence'", (max_vmid,))
             cur.execute("INSERT INTO vps_vmid_sequence (reserved_at) VALUES (CURRENT_TIMESTAMP)")
             vmid = int(cur.lastrowid)
             conn.commit()
@@ -1550,6 +1636,36 @@ def is_main_admin():
         raise commands.CheckFailure("Only the main admin can use this command.")
     return commands.check(predicate)
 
+async def remote_node_request(
+    node: Dict[str, Any],
+    method: str,
+    path: str,
+    *,
+    timeout: float = 10.0,
+    json_data: Optional[Dict[str, Any]] = None,
+):
+    """Authenticated remote-node HTTP request using an HTTP header, never a URL query secret."""
+    base = str(node.get('url') or '').rstrip('/')
+    api_key = str(node.get('api_key') or '')
+    if not base or not api_key:
+        raise RuntimeError(f"Remote node {node.get('name', node.get('id', '?'))!r} is missing URL/API key")
+    headers = {
+        'X-API-Key': api_key,
+        'Accept': 'application/json',
+    }
+    if json_data is not None:
+        headers['Content-Type'] = 'application/json'
+    response = await asyncio.to_thread(
+        requests.request,
+        method.upper(),
+        base + '/' + path.lstrip('/'),
+        headers=headers,
+        json=json_data,
+        timeout=float(timeout),
+    )
+    return response
+
+
 # LXC command execution with multi-node support
 async def execute_lxc(container_name: str, command: str, timeout: int = 120, node_id: Optional[int] = None):
     """Execute an LXC/LXD command without blocking the Discord event loop."""
@@ -1592,20 +1708,9 @@ async def execute_lxc(container_name: str, command: str, timeout: int = 120, nod
             logger.error(f"LXC error: {full_command} - {e}")
             raise
 
-    url = str(node.get('url') or '').rstrip('/') + '/api/execute'
-    api_key = node.get('api_key')
-    if not node.get('url') or not api_key:
-        raise RuntimeError(f"Remote node {node.get('name', node_id)!r} is missing URL/API key")
     data = {"command": full_command}
-    params = {"api_key": api_key}
     try:
-        response = await asyncio.to_thread(
-            requests.post,
-            url,
-            json=data,
-            params=params,
-            timeout=timeout,
-        )
+        response = await remote_node_request(node, 'POST', '/api/execute', timeout=timeout, json_data=data)
     except requests.exceptions.Timeout as e:
         raise RuntimeError(f"Remote execution timed out on {node['name']} after {timeout}s") from e
     except requests.exceptions.RequestException as e:
@@ -1874,16 +1979,25 @@ async def get_host_stats(node_id: int) -> Dict:
             "ram": get_host_ram_usage(),
             "disk": get_host_disk_usage(),
         }
-    url = str(node.get('url') or '').rstrip('/') + '/api/get_host_stats'
-    params = {"api_key": node.get('api_key')}
     try:
-        response = await asyncio.to_thread(requests.get, url, params=params, timeout=10)
+        response = await remote_node_request(node, 'GET', '/api/get_host_stats', timeout=10)
         response.raise_for_status()
         stats = response.json()
+        disk_raw = stats.get('disk', 'Unknown')
+        if isinstance(disk_raw, dict):
+            try:
+                used = int(disk_raw.get('used', 0) or 0)
+                total = int(disk_raw.get('total', 0) or 0)
+                pct = float(disk_raw.get('percent', 0.0) or 0.0)
+                disk_value = f"{used / (1024**3):.1f} GiB / {total / (1024**3):.1f} GiB ({pct:.1f}%)" if total else 'Unknown'
+            except (TypeError, ValueError):
+                disk_value = 'Unknown'
+        else:
+            disk_value = str(disk_raw)
         return {
             "cpu": float(stats.get('cpu', 0.0) or 0.0),
             "ram": float(stats.get('ram', 0.0) or 0.0),
-            "disk": stats.get('disk', 'Unknown'),
+            "disk": disk_value,
         }
     except Exception as e:
         logger.debug(f"Host stats unavailable on {node.get('name')}: {type(e).__name__}: {e}")
@@ -2007,11 +2121,9 @@ async def get_container_stats(container_name: str, node_id: Optional[int] = None
         return {"status": status, "cpu": cpu, "ram": ram, "disk": disk, "uptime": uptime}
     else:
         # Remote node - handle unreachable nodes gracefully without spamming logs
-        url = f"{node['url']}/api/get_container_stats"
         data = {"container": container_name}
-        params = {"api_key": node["api_key"]}
         try:
-            response = await asyncio.to_thread(requests.post, url, json=data, params=params, timeout=10)
+            response = await remote_node_request(node, 'POST', '/api/get_container_stats', timeout=10, json_data=data)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.ConnectionError:
@@ -2022,112 +2134,94 @@ async def get_container_stats(container_name: str, node_id: Optional[int] = None
             logger.debug(f"Failed to get container stats from remote node {node['name']}: {e}")
             return {"status": "unknown", "cpu": 0.0, "ram": {"used": 0, "total": 0, "pct": 0.0}, "disk": "Unknown", "uptime": "Unknown"}
 
+async def _run_local_lxc_capture(*args: str, timeout: float = 8.0):
+    proc = await asyncio.create_subprocess_exec(
+        'lxc', *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise
+    return proc.returncode, stdout.decode(errors='replace'), stderr.decode(errors='replace')
+
+
 async def get_container_status_local(container_name: str):
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "lxc", "info", container_name,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await proc.communicate()
-        output = stdout.decode()
+        _, output, _ = await _run_local_lxc_capture('info', container_name, timeout=6)
         for line in output.splitlines():
-            if line.startswith("Status: "):
-                return line.split(": ", 1)[1].strip().lower()
-        return "unknown"
+            if line.startswith('Status: '):
+                return line.split(': ', 1)[1].strip().lower()
+        return 'unknown'
     except Exception:
-        return "unknown"
+        return 'unknown'
+
 
 async def get_container_cpu_pct_local(container_name: str):
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "lxc", "exec", container_name, "--", "top", "-bn1",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await proc.communicate()
-        output = stdout.decode()
+        _, output, _ = await _run_local_lxc_capture('exec', container_name, '--', 'top', '-bn1', timeout=7)
         for line in output.splitlines():
-            if '%Cpu(s):' in line:
-                # Parse CPU line - format: %Cpu(s): us,sy,ni,id,wa,hi,si,st
-                # Remove label and split by commas
-                cpu_data = line.split('%Cpu(s):')[1].strip()
-                parts = []
-                for item in cpu_data.split(','):
-                    # Extract number before the percentage/label
-                    val = item.split()[0].strip()
-                    try:
-                        parts.append(float(val))
-                    except ValueError:
-                        parts.append(0.0)
-                
-                if len(parts) >= 8:
-                    us = parts[0]  # user
-                    sy = parts[1]  # system
-                    ni = parts[2]  # nice
-                    id_ = parts[3] # idle
-                    wa = parts[4]  # wait
-                    hi = parts[5]  # hardware interrupt
-                    si = parts[6]  # software interrupt
-                    st = parts[7]  # steal
-                    return us + sy + ni + wa + hi + si + st
+            if '%Cpu(s):' not in line:
+                continue
+            cpu_data = line.split('%Cpu(s):', 1)[1].strip()
+            parts = []
+            for item in cpu_data.split(','):
+                try:
+                    parts.append(float(item.split()[0]))
+                except (ValueError, IndexError):
+                    parts.append(0.0)
+            if len(parts) >= 8:
+                usage = sum(parts[i] for i in (0, 1, 2, 4, 5, 6, 7))
+                return max(0.0, min(100.0, usage))
         return 0.0
     except Exception as e:
-        logger.error(f"Error getting container CPU for {container_name}: {e}")
+        logger.debug(f'Error getting container CPU for {container_name}: {e}')
         return 0.0
+
 
 async def get_container_ram_local(container_name: str):
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "lxc", "exec", container_name, "--", "free", "-m",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await proc.communicate()
-        lines = stdout.decode().splitlines()
-        if len(lines) > 1:
-            parts = lines[1].split()
-            total = int(parts[1])
-            used = int(parts[2])
-            pct = (used / total * 100) if total > 0 else 0.0
-            return {'used': used, 'total': total, 'pct': pct}
+        _, output, _ = await _run_local_lxc_capture('exec', container_name, '--', 'free', '-m', timeout=6)
+        for line in output.splitlines():
+            if not line.lstrip().startswith(('Mem:', 'Mem ')):
+                continue
+            parts = line.split()
+            if len(parts) >= 3:
+                total = int(parts[1])
+                used = int(parts[2])
+                pct = (used / total * 100.0) if total > 0 else 0.0
+                return {'used': used, 'total': total, 'pct': pct}
         return {'used': 0, 'total': 0, 'pct': 0.0}
     except Exception as e:
-        logger.error(f"Error getting RAM for {container_name}: {e}")
+        logger.debug(f'Error getting RAM for {container_name}: {e}')
         return {'used': 0, 'total': 0, 'pct': 0.0}
+
 
 async def get_container_disk_local(container_name: str):
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "lxc", "exec", container_name, "--", "df", "-h", "/",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await proc.communicate()
-        lines = stdout.decode().splitlines()
+        _, output, _ = await _run_local_lxc_capture('exec', container_name, '--', 'df', '-h', '/', timeout=6)
+        lines = output.splitlines()
         for line in lines:
-            if '/dev/' in line and ' /' in line:
-                parts = line.split()
-                if len(parts) >= 5:
-                    used = parts[2]
-                    size = parts[1]
-                    perc = parts[4]
-                    return f"{used}/{size} ({perc})"
-        return "Unknown"
+            if ' /' not in line:
+                continue
+            parts = line.split()
+            if len(parts) >= 5 and parts[-1] == '/':
+                return f'{parts[2]}/{parts[1]} ({parts[4]})'
+        return 'Unknown'
     except Exception:
-        return "Unknown"
+        return 'Unknown'
+
 
 async def get_container_uptime_local(container_name: str):
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "lxc", "exec", container_name, "--", "uptime",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await proc.communicate()
-        return stdout.decode().strip() if stdout else "Unknown"
+        _, output, _ = await _run_local_lxc_capture('exec', container_name, '--', 'uptime', timeout=6)
+        return output.strip() if output.strip() else 'Unknown'
     except Exception:
-        return "Unknown"
+        return 'Unknown'
+
 
 async def get_container_status(container_name: str, node_id: Optional[int] = None):
     stats = await get_container_stats(container_name, node_id)
@@ -2351,10 +2445,15 @@ def find_vps_record(reference: str | int):
     for uid, items in vps_data.items():
         for idx, vps in enumerate(items):
             same_name = str(vps.get("container_name")) == wanted
-            same_id = numeric_id is not None and (
-                int(vps.get("id", -1) or -1) == numeric_id
-                or int(vps.get("vmid", -1) or -1) == numeric_id
-            )
+            candidate_ids = set()
+            for key in ("id", "vmid"):
+                try:
+                    value = int(vps.get(key, -1) or -1)
+                except (TypeError, ValueError):
+                    value = -1
+                if value > 0:
+                    candidate_ids.add(value)
+            same_id = numeric_id is not None and numeric_id in candidate_ids
             if same_name or same_id:
                 return str(uid), idx, vps
     return None, None, None
@@ -2757,45 +2856,100 @@ async def lxc_list(ctx, node_id: int = 1):
         await ctx.send(embed=create_error_embed("Error", str(e)))
 
 class NodeSelectView(discord.ui.View):
+    """Paginated node picker. Discord selects allow max 25 options; 20/page leaves room for controls."""
+    PAGE_SIZE = 20
+
     def __init__(self, ram: int, cpu: int, disk: int, user: discord.Member, ctx, expiry_days: int = None):
         super().__init__(timeout=300)
-        self.ram = ram
-        self.cpu = cpu
-        self.disk = disk
-        self.user = user
-        self.ctx = ctx
+        self.ram, self.cpu, self.disk = ram, cpu, disk
+        self.user, self.ctx = user, ctx
         self.expiry_days = expiry_days if expiry_days and expiry_days > 0 else DEFAULT_VPS_EXPIRATION_DAYS
-        nodes = get_nodes()
-        options = []
-        for n in nodes:
-            # Show BOTH local and remote nodes for VPS creation (multi-node support)
-            current_count = get_current_vps_count(int(n['id']))
+        self.page = 0
+        self.nodes = self._get_available_nodes()
+        self.select = None
+        self.prev_button = None
+        self.next_button = None
+        self.cancel_button = None
+        self._rebuild_items()
+
+    def _get_available_nodes(self):
+        result = []
+        for node in get_nodes():
             try:
-                capacity = int(n.get('total_vps') or 0)
-            except (TypeError, ValueError):
-                capacity = 0
-            if capacity > current_count:
-                node_type = "📍 Local" if n.get('is_local') else "🌐 Remote"
-                location = str(n.get('location') or 'Unknown')
-                description = f"{location[:60]} - Available: {capacity - current_count}"[:100]
-                options.append(discord.SelectOption(label=f"{str(n['name'])[:75]} {node_type}", value=str(n['id']), description=description))
-        if not options:
-            self.add_item(discord.ui.Select(placeholder="No available nodes", disabled=True))
-        else:
-            options = options[:25]
-            self.select = discord.ui.Select(placeholder="Select a Node for the VPS", options=options)
+                capacity = int(node.get('total_vps') or 0)
+                current = get_current_vps_count(int(node['id']))
+            except (TypeError, ValueError, KeyError):
+                continue
+            if capacity <= current:
+                continue
+            node['available_slots'] = capacity - current
+            result.append(node)
+        return result
+
+    def _rebuild_items(self):
+        self.clear_items()
+        total_pages = max(1, (len(self.nodes) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page = max(0, min(self.page, total_pages - 1))
+        page_nodes = self.nodes[self.page * self.PAGE_SIZE:(self.page + 1) * self.PAGE_SIZE]
+
+        if page_nodes:
+            options = []
+            for node in page_nodes:
+                kind = '📍 Local' if node.get('is_local') else '🌐 Remote'
+                label = f"{str(node.get('name') or 'Unnamed')[:70]} {kind}"
+                description = f"{str(node.get('location') or 'Unknown')[:60]} • {int(node.get('available_slots', 0))} slots"
+                options.append(discord.SelectOption(label=label, value=str(node['id']), description=description[:100]))
+            self.select = discord.ui.Select(placeholder=f'Select a Node • Page {self.page + 1}/{total_pages}', options=options)
             self.select.callback = self.select_node
             self.add_item(self.select)
+        else:
+            self.add_item(discord.ui.Select(placeholder='No available nodes', disabled=True, options=[discord.SelectOption(label='No capacity available', value='none')]))
+
+        self.prev_button = discord.ui.Button(label='◀ Previous', style=discord.ButtonStyle.secondary, row=1, disabled=self.page == 0)
+        self.next_button = discord.ui.Button(label='Next ▶', style=discord.ButtonStyle.secondary, row=1, disabled=self.page >= total_pages - 1)
+        self.cancel_button = discord.ui.Button(label='✖ Cancel', style=discord.ButtonStyle.secondary, row=1)
+        self.prev_button.callback = self.previous_page
+        self.next_button.callback = self.next_page
+        self.cancel_button.callback = self.cancel_view
+        self.add_item(self.prev_button)
+        self.add_item(self.next_button)
+        self.add_item(self.cancel_button)
+
+    async def _guard(self, interaction):
+        if str(interaction.user.id) != str(self.ctx.author.id):
+            await interaction.response.send_message(embed=create_error_embed('⛔ Access Denied', 'Only the command author can use this selector.'), ephemeral=True)
+            return False
+        return True
+
+    async def previous_page(self, interaction: discord.Interaction):
+        if not await self._guard(interaction):
+            return
+        self.page -= 1
+        self._rebuild_items()
+        await interaction.response.edit_message(view=self)
+
+    async def next_page(self, interaction: discord.Interaction):
+        if not await self._guard(interaction):
+            return
+        self.page += 1
+        self._rebuild_items()
+        await interaction.response.edit_message(view=self)
+
+    async def cancel_view(self, interaction: discord.Interaction):
+        if not await self._guard(interaction):
+            return
+        await interaction.response.edit_message(embed=create_info_embed('🚫 Deployment Cancelled', 'No VPS was created.'), view=None)
+        self.stop()
 
     async def select_node(self, interaction: discord.Interaction):
-        if str(interaction.user.id) != str(self.ctx.author.id):
-            await interaction.response.send_message(embed=create_error_embed("Access Denied", "Only the command author can select."), ephemeral=True)
+        if not await self._guard(interaction):
             return
         node_id = int(self.select.values[0])
-        self.select.disabled = True
-        await interaction.response.edit_message(view=self)
+        self.stop()
+        await interaction.response.edit_message(view=None)
         os_view = OSSelectView(self.ram, self.cpu, self.disk, self.user, self.ctx, node_id, self.expiry_days)
-        await interaction.followup.send(embed=create_info_embed("Select OS", "Choose the OS for the VPS."), view=os_view)
+        await interaction.followup.send(embed=create_info_embed('💿 Select Operating System', 'Choose the operating system for this VPS.'), view=os_view)
+
 
 class OSSelectView(discord.ui.View):
     def __init__(self, ram: int, cpu: int, disk: int, user: discord.Member, ctx, node_id: int, expiry_days: int = None):
@@ -3004,7 +3158,7 @@ class OSSelectView(discord.ui.View):
             try:
                 ssh_port = await create_port_forward(str(user_id), container_name, 22, self.node_id)
                 logger.info(f"   ✅ Auto-created SSH port forward: port 22 → {ssh_port}")
-                ssh_command = f"ssh root@{YOUR_SERVER_IP} -p {ssh_port}"
+                ssh_command = f"ssh root@{ssh_host_literal(node_public_host(get_node(node_id)))} -p {ssh_port}"
             except Exception as ssh_err:
                 logger.warning(f"Could not auto-create SSH port forward: {ssh_err}")
                 ssh_command = "SSH port forward creation failed - contact admin"
@@ -3622,7 +3776,7 @@ class ManageView(discord.ui.View):
             except Exception:
                 pass
         if sshx_url:
-            sshx_block = f"SSH Command:\n`ssh root@{YOUR_SERVER_IP} -p {self._ssh_host_port(container_name, forwards) or 'N/A'}`\nHost: `{YOUR_SERVER_IP}`\nPort: `{self._ssh_host_port(container_name, forwards) or 'N/A'}`\nStatus: {'🟢 Tunnel Active' if sshx_active else '🟡 Reconnect Available'}\nSSHX: <{sshx_url}>\n(Click 🔄 **Reconnect Tunnel** if disconnected)"
+            sshx_block = f"SSH Command:\n`ssh root@{ssh_host_literal(node_public_host(get_node(node_id)))} -p {self._ssh_host_port(container_name, forwards) or 'N/A'}`\nHost: `{ssh_host_literal(node_public_host(get_node(node_id)))}`\nPort: `{self._ssh_host_port(container_name, forwards) or 'N/A'}`\nStatus: {'🟢 Tunnel Active' if sshx_active else '🟡 Reconnect Available'}\nSSHX: <{sshx_url}>\n(Click 🔄 **Reconnect Tunnel** if disconnected)"
         else:
             sshx_block = "Status: 🟡 Not Connected\nUse 🌐 **SSHX** or 🔄 **Reconnect Tunnel** to create a session."
 
@@ -3779,7 +3933,9 @@ class ManageView(discord.ui.View):
                     ssh_port = self._ssh_host_port(container_name, forwards)
                     if not ssh_port:
                         ssh_port = await create_port_forward(self.owner_id, container_name, 22, node_id)
-                    command = f"ssh root@{YOUR_SERVER_IP} -p {ssh_port}" if ssh_port else "SSH forwarding unavailable"
+                    node = get_node(node_id) or {}
+                    public_host = ssh_host_literal(node_public_host(node))
+                    command = f"ssh root@{public_host} -p {ssh_port}" if ssh_port else "SSH forwarding unavailable"
                     access = create_info_embed("🌐 RGNODES™ Remote Access", f"`{container_name}` • `{VPS_HOSTNAME}`")
                     sshx_display = f"<{sshx_url}>\n🟢 Tunnel Active" if sshx_url else "🟡 SSHX unavailable — use Reconnect Tunnel again."
                     add_field(access, "🌐 SSHX", sshx_display, False)
@@ -3999,7 +4155,7 @@ async def get_node_status(node_id: int) -> str:
         return "🟢 Online (Local)"
     # Remote nodes - check connectivity but don't spam errors
     try:
-        response = await asyncio.to_thread(requests.get, str(node['url']).rstrip('/') + '/api/ping', params={'api_key': node['api_key']}, timeout=5)
+        response = await remote_node_request(node, 'GET', '/api/ping', timeout=5)
         if response.status_code == 200:
             return "🟢 Online"
         else:
@@ -4422,7 +4578,7 @@ async def ports_command(ctx, subcmd: str = None, *args):
         host_port = await create_port_forward(user_id, container, vps_port, node_id)
         if host_port:
             embed = create_success_embed("Port Forward Created", f"VPS #{vps_num} port {vps_port} (TCP/UDP) forwarded to host port {host_port}.")
-            add_field(embed, "Access", f"External: {YOUR_SERVER_IP}:{host_port} → VPS:{vps_port} (TCP & UDP)", False)
+            add_field(embed, "Access", f"External: {ssh_host_literal(node_public_host(get_node(node_id)))}:{host_port} → VPS:{vps_port} (TCP & UDP)", False)
             add_field(embed, "Quota Update", f"Used: {used + 1}/{allocated}", False)
             await ctx.send(embed=embed)
         else:
@@ -4907,7 +5063,7 @@ async def system_status(ctx):
         else:
             # Check remote node status
             try:
-                response = await asyncio.to_thread(requests.get, str(node['url']).rstrip('/') + '/api/ping', params={'api_key': node['api_key']}, timeout=5)
+                response = await remote_node_request(node, 'GET', '/api/ping', timeout=5)
                 if response.status_code == 200:
                     status = "🟢 Online"
                     running_nodes += 1
@@ -5060,7 +5216,7 @@ async def status_summary(ctx):
             running_nodes += 1
         else:
             try:
-                response = await asyncio.to_thread(requests.get, str(node['url']).rstrip('/') + '/api/ping', params={'api_key': node['api_key']}, timeout=3)
+                response = await remote_node_request(node, 'GET', '/api/ping', timeout=3)
                 if response.status_code == 200:
                     running_nodes += 1
             except:
@@ -5901,7 +6057,7 @@ async def node_check(ctx, node_id: int):
         
         # Check remote API endpoint
         try:
-            test_response = await asyncio.to_thread(requests.get, str(node['url']).rstrip('/') + '/api/ping', params={'api_key': node['api_key']}, timeout=5)
+            test_response = await remote_node_request(node, 'GET', '/api/ping', timeout=5)
             add_field(embed, "🔌 API Endpoint", f"✅ Reachable\nURL: {node['url']}", False)
         except Exception as e:
             add_field(embed, "🔌 API Endpoint", f"❌ Unreachable\nError: {str(e)[:200]}", False)
@@ -6898,7 +7054,7 @@ async def sshx_command(ctx, container_name: str = None):
         if not ssh_port:
             ssh_port = await create_port_forward(str(target_user_id), container, 22, node_id)
 
-        command = f"ssh root@{YOUR_SERVER_IP} -p {ssh_port}" if ssh_port else "SSH forwarding unavailable"
+        command = f"ssh root@{ssh_host_literal(node_public_host(get_node(node_id)))} -p {ssh_port}" if ssh_port else "SSH forwarding unavailable"
         access = create_success_embed("🌐 RGNODES™ SSHX Connected", f"Your VPS `{container}` is ready for remote access.")
         add_field(access, "🖥️ VPS", f"VMID: `{target.get('vmid') or target.get('id')}`\nHostname: `{VPS_HOSTNAME}`\nNode: `{(get_node(node_id) or {}).get('name', 'Unknown')}`", False)
         add_field(access, "💻 SSH", f"```bash\n{command}\n```\nUsername: `root`\nPassword: `{target.get('root_password') or 'not available'}`", False)
@@ -7132,6 +7288,83 @@ async def help_search(ctx, *, search_term: str = None):
     embed.set_footer(text=f"⚡ RGNODES™ • Use {PREFIX}help for complete list")
     await ctx.send(embed=embed)    
 
+class NodeListView(discord.ui.View):
+    PAGE_SIZE = 6
+
+    def __init__(self, ctx, nodes):
+        super().__init__(timeout=300)
+        self.ctx = ctx
+        self.nodes = nodes
+        self.page = 0
+        self._rebuild()
+
+    async def build_embed(self):
+        total_pages = max(1, (len(self.nodes) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page = max(0, min(self.page, total_pages - 1))
+        embed = create_info_embed('🌐 RGNODES™ Node Cluster', '')
+        if not self.nodes:
+            add_field(embed, 'Nodes', 'No nodes configured.', False)
+            return embed
+        chunk = self.nodes[self.page*self.PAGE_SIZE:(self.page+1)*self.PAGE_SIZE]
+        for n in chunk:
+            status = await get_node_status(int(n['id']))
+            used = get_current_vps_count(int(n['id']))
+            cap = int(n.get('total_vps') or 0)
+            kind = '📍 Local' if n.get('is_local') else '🌐 Remote'
+            value = (f"**Type:** {kind}\n**Location:** {n.get('location') or 'Unknown'}\n"
+                     f"**Capacity:** {used}/{cap}\n**Status:** {status}\n"
+                     f"**Public Host:** `{node_public_host(n) or 'N/A'}`")
+            if not n.get('is_local'):
+                value += f"\n**Agent:** `{str(n.get('url') or 'N/A')[:180]}`"
+            add_field(embed, f"Node #{n['id']} • {n.get('name','Unnamed')}", value, False)
+        embed.set_footer(text=f'⚡ RGNODES™ • Nodes • Page {self.page+1}/{total_pages}')
+        return embed
+
+    def _rebuild(self):
+        self.clear_items()
+        total_pages = max(1, (len(self.nodes) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.prev_button = discord.ui.Button(label='◀ Previous', style=discord.ButtonStyle.secondary, disabled=self.page == 0)
+        self.next_button = discord.ui.Button(label='Next ▶', style=discord.ButtonStyle.secondary, disabled=self.page >= total_pages - 1)
+        self.refresh_button = discord.ui.Button(label='🔄 Refresh', style=discord.ButtonStyle.secondary)
+        self.close_button = discord.ui.Button(label='✖ Close', style=discord.ButtonStyle.secondary)
+        self.prev_button.callback = self.previous
+        self.next_button.callback = self.next
+        self.refresh_button.callback = self.refresh
+        self.close_button.callback = self.close
+        for b in (self.prev_button, self.next_button, self.refresh_button, self.close_button):
+            self.add_item(b)
+
+    async def guard(self, interaction):
+        if str(interaction.user.id) != str(self.ctx.author.id):
+            await interaction.response.send_message(embed=create_error_embed('⛔ Access Denied', 'Only the admin who opened this panel can use it.'), ephemeral=True)
+            return False
+        return True
+
+    async def render(self, interaction):
+        self._rebuild()
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    async def previous(self, interaction):
+        if not await self.guard(interaction): return
+        self.page -= 1
+        await self.render(interaction)
+
+    async def next(self, interaction):
+        if not await self.guard(interaction): return
+        self.page += 1
+        await self.render(interaction)
+
+    async def refresh(self, interaction):
+        if not await self.guard(interaction): return
+        self.nodes = get_nodes()
+        await self.render(interaction)
+
+    async def close(self, interaction):
+        if not await self.guard(interaction): return
+        await interaction.response.edit_message(view=None)
+        self.stop()
+
+
 @bot.command(name='node')
 @is_admin()
 async def node_cmd(ctx, sub: str, *args):
@@ -7153,51 +7386,49 @@ async def node_cmd(ctx, sub: str, *args):
         tags_str = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip()
         tags = [t.strip() for t in tags_str.split(',') if t.strip()]
         tags_json = json.dumps(tags)
-        await ctx.send("Enter node URL (e.g., http://ip:port or https://ip:port) or leave blank for local:")
+        await ctx.send("Enter node URL (e.g., http://ip:port or https://ip:port), or leave blank for local:")
         url_str = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip()
-        
-        # Normalize URL if provided
-        if url_str:
-            if not url_str.startswith('http://') and not url_str.startswith('https://'):
-                url_str = f'http://{url_str}'
-            url = url_str
-        else:
-            url = None
-        
+        if url_str and not url_str.startswith(('http://', 'https://')):
+            url_str = f'http://{url_str}'
+        url = url_str or None
+
+        await ctx.send("Enter public host/IP for user SSH and forwarded ports ( . = auto-detect ):" )
+        public_host_input = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip()
+        public_host = normalize_public_host('' if public_host_input == '.' else public_host_input)
+
         is_local = 1 if not url else 0
-        api_key = None if is_local else secrets.token_hex(16)
+        api_key = None if is_local else secrets.token_hex(32)
+        if not public_host:
+            public_host = normalize_public_host(YOUR_SERVER_IP if is_local else url_str)
         conn = get_db()
         cur = conn.cursor()
         try:
-            cur.execute('INSERT INTO nodes (name, location, total_vps, tags, api_key, url, is_local) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                        (name, location, total_vps, tags_json, api_key, url, is_local))
+            cur.execute('INSERT INTO nodes (name, location, total_vps, tags, api_key, url, is_local, public_host) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                        (name, location, total_vps, tags_json, api_key, url, is_local, public_host))
             conn.commit()
             node_id = cur.lastrowid
-            embed = create_success_embed("Node Created", f"ID: {node_id}\nName: {name}\nLocation: {location}\nCapacity: {total_vps}\nTags: {', '.join(tags)}")
+            embed = create_success_embed("Node Created", f"ID: {node_id}\nName: {name}\nLocation: {location}\nCapacity: {total_vps}\nTags: {', '.join(tags)}\nPublic Host: {public_host or 'N/A'}")
             if not is_local:
-                add_field(embed, "API Key", api_key, False)
-                add_field(embed, "URL", url, False)
-                add_field(embed, "Setup", f"Run `python node-agent.py --api_key={api_key} --port=PORT` on the node server.")
+                add_field(embed, "Remote API", f"`{url}`\n🔐 API key was generated securely and will be delivered by DM.", False)
+                add_field(embed, "Setup", "Run `install_node_agent.sh` on the remote node, or manually start `node-agent.py` with the generated key.", False)
             await ctx.send(embed=embed)
+            if not is_local and api_key:
+                try:
+                    dm = create_success_embed("🔐 Remote Node API Key", f"Node: **{name}** (ID: `{node_id}`)\n\nStore this key securely. It grants the RGNODES™ bot permission to execute LXC commands on this node.")
+                    add_field(dm, "API Key", f"`{api_key}`", False)
+                    add_field(dm, "Node URL", str(url), False)
+                    add_field(dm, "Service", "`rgnodes-node-agent.service` on port `18443`", False)
+                    add_field(dm, "Security", "Keep this key private. Prefer a private network/firewall or TLS for the agent endpoint.", False)
+                    await ctx.author.send(embed=dm)
+                    await ctx.send(embed=create_info_embed("🔐 Node Credentials", "The remote node API key was sent to your DMs."))
+                except discord.Forbidden:
+                    await ctx.send(embed=create_warning_embed("⚠️ API Key Not DM'd", "Your DMs are closed. Use `-node regen-key <id>` after enabling DMs, then save the credential securely."))
         except sqlite3.IntegrityError:
             await ctx.send(embed=create_error_embed("Error", "Node name already exists."))
         conn.close()
     elif sub == 'list':
-        nodes = get_nodes()
-        embed = create_info_embed("Nodes List", "")
-        for n in nodes:
-            status = "Local" if n['is_local'] else "Down"
-            if not n['is_local']:
-                try:
-                    response = await asyncio.to_thread(requests.get, str(n['url']).rstrip('/') + '/api/ping', params={'api_key': n['api_key']}, timeout=5)
-                    status = "Up" if response.status_code == 200 else "Down"
-                except:
-                    pass
-            field = f"ID: {n['id']}\nName: {n['name']}\nLocation: {n['location']}\nCapacity: {n['total_vps']}\nTags: {', '.join(n['tags'])}\nStatus: {status}"
-            if not n['is_local']:
-                field += f"\nURL: {n['url']}"
-            add_field(embed, f"Node {n['id']}", field, False)
-        await ctx.send(embed=embed)
+        view = NodeListView(ctx, get_nodes())
+        await ctx.send(embed=await view.build_embed(), view=view)
     elif sub == 'edit':
         if not args:
             await ctx.send(embed=create_error_embed("Usage", f"{PREFIX}node edit <id>"))
@@ -7229,7 +7460,11 @@ async def node_cmd(ctx, sub: str, *args):
         new_tags = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip()
         if new_tags != '.':
             node['tags'] = [t.strip() for t in new_tags.split(',') if t.strip()]
-        
+        await ctx.send("New public host/IP for user SSH and forwarded ports ( . to skip ):" )
+        new_public_host = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip()
+        if new_public_host != '.':
+            node['public_host'] = normalize_public_host(new_public_host)
+
         # NEW: Add conversion option between Local and Dynamic
         if node['is_local']:
             await ctx.send("Convert Local Node to Dynamic URL-based Node? (y/n):")
@@ -7247,7 +7482,7 @@ async def node_cmd(ctx, sub: str, *args):
                 
                 node['url'] = url_str
                 node['is_local'] = 0
-                node['api_key'] = secrets.token_hex(16)
+                node['api_key'] = secrets.token_hex(32)
                 await ctx.send(f"✅ Node converted to Dynamic!\n\n**URL:** `{url_str}`\n**Generated API Key:** `{node['api_key']}`\n\n**Setup Command:**\n```\npython node-agent.py --api_key={node['api_key']} --port=PORT\n```")
         else:
             await ctx.send("Convert Dynamic Node to Local? (y/n):")
@@ -7268,12 +7503,12 @@ async def node_cmd(ctx, sub: str, *args):
                 await ctx.send("Regenerate API key? (y/n):")
                 regen = (await asyncio.wait_for(bot.wait_for('message', check=check), timeout=180)).content.strip().lower()
                 if regen == 'y':
-                    node['api_key'] = secrets.token_hex(16)
+                    node['api_key'] = secrets.token_hex(32)
         
         conn = get_db()
         cur = conn.cursor()
-        cur.execute('UPDATE nodes SET name=?, location=?, total_vps=?, tags=?, api_key=?, url=?, is_local=? WHERE id=?',
-                    (node['name'], node['location'], node['total_vps'], json.dumps(node['tags']), node.get('api_key'), node.get('url'), node['is_local'], node_id))
+        cur.execute('UPDATE nodes SET name=?, location=?, total_vps=?, tags=?, api_key=?, url=?, is_local=?, public_host=? WHERE id=?',
+                    (node['name'], node['location'], node['total_vps'], json.dumps(node['tags']), node.get('api_key'), node.get('url'), node['is_local'], normalize_public_host(node.get('public_host')), node_id))
         conn.commit()
         conn.close()
         embed = create_success_embed("Node Updated", f"ID: {node_id}\nName: {node['name']}\nLocation: {node['location']}\nCapacity: {node['total_vps']}\nTags: {', '.join(node['tags'])}\nType: {'Local' if node['is_local'] else 'Dynamic'}")
@@ -7469,13 +7704,11 @@ async def node_cmd(ctx, sub: str, *args):
             add_field(embed, "RAM Usage", f"{ram_usage:.1f}%", True)
         else:
             try:
-                response = await asyncio.to_thread(requests.get, str(node['url']).rstrip('/') + '/api/ping', params={'api_key': node['api_key']}, timeout=5)
+                response = await remote_node_request(node, 'GET', '/api/ping', timeout=5)
                 if response.status_code == 200:
                     status = "🟢 Online"
                     try:
-                        stats_response = await asyncio.to_thread(requests.get, str(node['url']).rstrip('/') + '/api/get_host_stats', 
-                                                    params={'api_key': node['api_key']}, 
-                                                    timeout=5)
+                        stats_response = await remote_node_request(node, 'GET', '/api/get_host_stats', timeout=5)
                         if stats_response.status_code == 200:
                             stats = stats_response.json()
                             cpu_usage = stats.get('cpu', 0.0)
@@ -7493,7 +7726,10 @@ async def node_cmd(ctx, sub: str, *args):
             add_field(embed, "Status", status, True)
         
         vps_count = get_current_vps_count(node_id)
-        capacity = node['total_vps']
+        try:
+            capacity = max(0, int(node.get('total_vps') or 0))
+        except (TypeError, ValueError):
+            capacity = 0
         usage_percentage = (vps_count / capacity * 100) if capacity > 0 else 0
         
         add_field(embed, "VPS Capacity", f"{vps_count}/{capacity} ({usage_percentage:.1f}%)", True)
@@ -7528,11 +7764,11 @@ async def node_cmd(ctx, sub: str, *args):
             return
         
         # Confirm regeneration
-        warning_embed = create_warning_embed("⚠️ Regenerate API Key", 
+        warning_embed = create_warning_embed("⚠️ Regenerate API Key",
             f"You are about to regenerate the API key for node **{node['name']}**.\n\n"
-            f"**Current API Key:** `{node['api_key']}`\n\n"
+            f"The current credential will be invalidated.\n\n"
             f"**This action will:**\n"
-            f"• Generate a new 32-character API key\n"
+            f"• Generate a new 64-character hexadecimal API key\n"
             f"• Invalidate the old API key\n"
             f"• Require updating the remote node agent\n\n"
             f"Are you sure you want to continue?")
@@ -7555,7 +7791,7 @@ async def node_cmd(ctx, sub: str, *args):
                 await inter.response.defer()
                 
                 # Generate new API key
-                new_api_key = secrets.token_hex(16)
+                new_api_key = secrets.token_hex(32)
                 
                 # Update database
                 conn = get_db()
@@ -7565,20 +7801,20 @@ async def node_cmd(ctx, sub: str, *args):
                 conn.close()
                 
                 # Create success embed with new key
-                success_embed = create_success_embed("✅ API Key Regenerated", 
-                    f"Node **{self.node['name']}** (ID: {self.node_id})")
-                
-                add_field(success_embed, "Old API Key", f"`{self.node['api_key']}`", False)
-                add_field(success_embed, "New API Key", f"`{new_api_key}`", False)
-                add_field(success_embed, "Node URL", self.node['url'], True)
-                
-                setup_command = f"python node-agent.py --api_key={new_api_key} --port=PORT"
-                add_field(success_embed, "Update Remote Agent", 
-                    f"SSH to the remote server and restart with:\n```\n{setup_command}\n```", False)
-                
-                add_field(success_embed, "⚠️ Important", 
-                    "The old API key is now invalid. Update your remote node agent immediately.", False)
-                
+                success_embed = create_success_embed("✅ API Key Regenerated",
+                    f"Node **{self.node['name']}** (ID: {self.node_id})\nThe old credential is now invalid.")
+                add_field(success_embed, "Node URL", self.node['url'], False)
+                add_field(success_embed, "Update Remote Agent",
+                    "Run `install_node_agent.sh` again or update `/etc/rgnodes/node-agent.env` with the new key, then restart `rgnodes-node-agent.service`.", False)
+                try:
+                    dm = create_success_embed("🔐 New Remote Node API Key", f"Node: **{self.node['name']}** (ID: `{self.node_id}`)")
+                    add_field(dm, "New API Key", f"`{new_api_key}`", False)
+                    add_field(dm, "Node URL", str(self.node['url']), False)
+                    add_field(dm, "Restart", "`sudo systemctl restart rgnodes-node-agent.service`", False)
+                    await inter.user.send(embed=dm)
+                    add_field(success_embed, "Credential Delivery", "✅ New API key sent to your DMs.", False)
+                except discord.Forbidden:
+                    add_field(success_embed, "Credential Delivery", "⚠️ DM failed because your DMs are closed. Enable DMs and run `-node regen-key` again.", False)
                 await inter.followup.send(embed=success_embed)
                 self.stop()
             
