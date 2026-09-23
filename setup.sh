@@ -17,19 +17,21 @@ LOG_FILE="/var/log/rgnodes-setup.log"
 LOCK_FILE="/run/lock/rgnodes-setup.lock"
 BACKUP_ROOT="/var/backups/rgnodes-bot"
 
+[[ $EUID -eq 0 ]] || { printf "❌ Run as root: sudo bash %s\n" "$0" >&2; exit 1; }
+
 mkdir -p /run/lock "$BACKUP_ROOT" /var/log
-exec 9>"$LOCK_FILE"
-if command -v flock >/dev/null 2>&1; then
-  flock -n 9 || die "Another RGNODES™ setup/repair process is already running."
-fi
-exec > >(tee -a "$LOG_FILE") 2>&1
 
 log(){ printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 warn(){ log "⚠️ $*"; }
 die(){ log "❌ $*"; exit 1; }
 trap 'rc=$?; (( rc != 0 )) && warn "Setup stopped at line $LINENO (exit $rc). See $LOG_FILE"' EXIT
 
-[[ $EUID -eq 0 ]] || die 'Run as root: sudo bash setup_rgnodes.sh'
+exec 9>"$LOCK_FILE"
+if command -v flock >/dev/null 2>&1; then
+  flock -n 9 || die "Another RGNODES™ setup/repair process is already running."
+fi
+exec > >(tee -a "$LOG_FILE") 2>&1
+
 command -v apt >/dev/null 2>&1 || die 'apt is required.'
 
 export DEBIAN_FRONTEND=noninteractive
@@ -140,6 +142,9 @@ log "🦎 Detecting LXD..."
 if ! command -v lxc >/dev/null 2>&1; then
   log "LXD CLI missing; installing official snap package."
   systemctl enable --now snapd.socket >/dev/null 2>&1 || true
+  if command -v snap >/dev/null 2>&1; then
+    snap wait system seed.loaded >/dev/null 2>&1 || true
+  fi
   if ! snap list lxd >/dev/null 2>&1; then
     snap install lxd
   fi
@@ -274,6 +279,7 @@ else
 fi
 
 install -m 0755 "$BOT_SOURCE" "$APP_DIR/bot.py"
+if [[ -f "$SCRIPT_DIR/rgnodes_selfcheck.sh" ]]; then install -m 0755 "$SCRIPT_DIR/rgnodes_selfcheck.sh" /usr/local/sbin/rgnodes-selfcheck; fi
 install -m 0644 "$REQ_SOURCE" "$APP_DIR/requirements.txt"
 if [[ -f "$SCRIPT_DIR/node-agent.py" ]]; then
   install -m 0755 "$SCRIPT_DIR/node-agent.py" "$APP_DIR/node-agent.py"
